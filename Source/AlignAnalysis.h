@@ -6,16 +6,20 @@
 //   audio thread  --push-->  CaptureRing  --pop-->  analysis thread: PairEstimator  -->  Status
 //
 // PairEstimator (single-threaded, also used directly by the tests):
-//   1. Cuts both signals into overlapping windows (Hann, ~4x the delay range long).
-//   2. Keeps only windows where both tracks have real, transient-rich signal (hits),
-//      judged on the first difference (+6 dB/oct) so a kick's low end doesn't dominate.
-//   3. Accumulates the cross-spectrum X.R* and both power spectra over the kept windows.
-//   4. Correlates with coherence weighting (frequencies the two mics really share count most;
-//      bleed, noise and one-mic-only content count little) -> a sharp peak at the true lag.
-//   5. Refines the peak to a fraction of a sample by evaluating the band-limited correlation
+//   1. Finds the reference's own hits (its transient envelope rising through 30 % of its recent
+//      loud-hit level, 80 ms apart at most) and takes one window per hit, starting 10 ms + the
+//      delay range before it, ~4x the delay range long (Hann).
+//   2. Accumulates the cross-spectrum X.R* over all hits, and separately in 6 round-robin groups.
+//   3. Correlation, half-whitened (cross-spectrum divided by the 4th root of both power spectra)
+//      and A-weighted. Chosen on Corey's 7-song drum session against plain, +6 dB/oct, A-weighted,
+//      PHAT, SCOT and coherence (ML) weighting: the only one that gave the same answer song after
+//      song on every snare pair AND a physically sensible one (snare bottom 0.45 ms, inverted).
+//      Plain/A-weighted locks onto drum ringing; full whitening falls apart on overheads.
+//   4. Refines the peak to a fraction of a sample by evaluating the band-limited correlation
 //      directly (exact interpolation), reads the polarity from its sign.
-//   6. Confidence = how many single windows agree on that lag, and how far the peak stands out.
-//   7. Lists other strong peaks ("alternate points") for the Earlier/Later buttons.
+//   5. "Sure" = how many of the 6 groups, on their own, land on the same lag (within 2 samples)
+//      and polarity. Pairs that don't really share a sound (or are ambiguous) disagree.
+//   6. Lists other strong peaks ("alternate points") for the Earlier/Later buttons.
 //
 // Sign convention: lagSamples > 0 means this track hears the source LATER than the reference,
 // so the correction is Delay = -lagSamples. polarity -1 means it's inverted relative to the reference.
@@ -99,7 +103,7 @@ struct AlignResult
     bool   valid = false;           // there's a measurement at all
     double lagSamples = 0.0;
     int    polarity = 1;
-    double agreement = 0.0;         // 0..1: fraction of single windows that agree within 1.5 samples
+    double agreement = 0.0;         // 0..1: fraction of the 6 hit groups that land on the same lag/polarity
     double peakRatio = 0.0;         // peak / rms of the rest of the correlation
     double confidence = 0.0;        // 0..1, what the UI shows
     int    windows = 0;             // windows (hits) used
@@ -110,6 +114,8 @@ struct AlignResult
 class PairEstimator
 {
 public:
+    static constexpr int kSubsets = 6;   // hits are dealt round-robin into 6 groups; "sure" = how many groups agree
+
     // maxLag: the largest |lag| to search, in samples (the plug-in's delay range).
     void prepare (double sampleRate, int maxLagSamples)
     {
@@ -117,53 +123,80 @@ public:
         maxLag = std::max (1, maxLagSamples);
         win = 4096;
         while (win < 4 * maxLag) win <<= 1;
-        hop = win / 2;
         nfft = 2 * win;
         fft.prepare (nfft);
-        bufX.assign ((size_t) win, 0.0f);
-        bufR.assign ((size_t) win, 0.0f);
+        hist = 1; while (hist < 2 * win + (int) (0.2 * sr)) hist <<= 1;
+        histX.assign ((size_t) hist, 0.0f);
+        histR.assign ((size_t) hist, 0.0f);
         hann.resize ((size_t) win);
         for (int i = 0; i < win; ++i) hann[(size_t) i] = 0.5 - 0.5 * std::cos (2.0 * 3.14159265358979323846 * i / win);
         nb = nfft / 2 + 1;
-        sxr.assign ((size_t) nb, cplx {});
-        sxx.assign ((size_t) nb, 0.0);
-        srr.assign ((size_t) nb, 0.0);
+        kLo = std::max (1, (int) std::ceil (30.0 * nfft / sr));
+        kHi = std::min (nb - 1, (int) std::floor (std::min (18000.0, 0.45 * sr) * nfft / sr));
+        aw.assign ((size_t) nb, 0.0);
+        for (int k = kLo; k <= kHi; ++k) aw[(size_t) k] = aWeightPower ((double) k * sr / nfft);
+        total.assign ((size_t) nb, cplx {});
+        for (auto& v : sub) v.assign ((size_t) nb, cplx {});
+        pxx.assign ((size_t) nb, 0.0); prr.assign ((size_t) nb, 0.0);
+        for (auto& v : subXX) v.assign ((size_t) nb, 0.0);
+        for (auto& v : subRR) v.assign ((size_t) nb, 0.0);
         fx.assign ((size_t) nfft, cplx {});
         fr.assign ((size_t) nfft, cplx {});
         work.assign ((size_t) nfft, cplx {});
-        kLo = std::max (1, (int) std::ceil (40.0 * nfft / sr));
-        kHi = std::min (nb - 1, (int) std::floor (std::min (18000.0, 0.45 * sr) * nfft / sr));
+        holdDecay  = std::exp (-1.0 / (0.002 * sr));   // 2 ms peak hold on the reference's transient envelope
+        levelDecay = std::exp (-1.0 / (3.0 * sr));     // loud-hit level, forgets over ~3 s
+        refractory = (long long) (0.08 * sr);
+        preRoll    = (long long) (0.010 * sr) + maxLag; // window starts 10 ms + the delay range before the hit
         reset();
     }
 
     void reset()
     {
-        fill = 0;
-        windows = 0;
-        std::fill (sxr.begin(), sxr.end(), cplx {});
-        std::fill (sxx.begin(), sxx.end(), 0.0);
-        std::fill (srr.begin(), srr.end(), 0.0);
-        perWindowLag.clear();
-        maxEx = maxEr = 0.0;
+        n = 0; windows = 0; nPending = 0;
+        lastOnset = -(1LL << 40);
+        env = level = 0.0; prevR = 0.0f; above = false;
+        std::fill (total.begin(), total.end(), cplx {});
+        for (auto& v : sub) std::fill (v.begin(), v.end(), cplx {});
+        std::fill (pxx.begin(), pxx.end(), 0.0); std::fill (prr.begin(), prr.end(), 0.0);
+        for (auto& v : subXX) std::fill (v.begin(), v.end(), 0.0);
+        for (auto& v : subRR) std::fill (v.begin(), v.end(), 0.0);
+        std::fill (histX.begin(), histX.end(), 0.0f);
+        std::fill (histR.begin(), histR.end(), 0.0f);
     }
 
     int windowLength() const noexcept { return win; }
     int windowsUsed()  const noexcept { return windows; }
 
     // Feed time-aligned samples of this track (x) and the reference (r), as recorded.
-    void feed (const float* x, const float* r, int n)
+    void feed (const float* x, const float* r, int count)
     {
-        for (int i = 0; i < n; ++i)
+        for (int i = 0; i < count; ++i)
         {
-            bufX[(size_t) fill] = x[i];
-            bufR[(size_t) fill] = r[i];
-            if (++fill == win)
+            histX[(size_t) (n & (hist - 1))] = x[i];
+            histR[(size_t) (n & (hist - 1))] = r[i];
+
+            // hits of the reference: its transient envelope (first difference, 2 ms hold) rising
+            // through 30 % of its recent loud-hit level
+            const double d = std::abs ((double) r[i] - prevR);
+            prevR = r[i];
+            env = std::max (d, env * holdDecay);
+            level = std::max (env, level * levelDecay);
+            const bool on = env > 0.3 * level && level > 1e-5;
+            if (on && ! above && n - lastOnset > refractory && nPending < (int) pending.size())
             {
-                analyseWindow();
-                // keep the second half for the next (50 % overlapping) window
-                std::copy (bufX.begin() + hop, bufX.end(), bufX.begin());
-                std::copy (bufR.begin() + hop, bufR.end(), bufR.begin());
-                fill = win - hop;
+                pending[(size_t) nPending++] = n - preRoll;
+                lastOnset = n;
+            }
+            above = on;
+            ++n;
+
+            // windows whose audio is complete
+            while (nPending > 0 && n >= pending[0] + win)
+            {
+                const long long s = pending[0];
+                for (int k = 1; k < nPending; ++k) pending[(size_t) (k - 1)] = pending[(size_t) k];
+                --nPending;
+                if (s >= 0 && n - s <= hist) analyseWindow (s);
             }
         }
     }
@@ -174,36 +207,13 @@ public:
         res.windows = windows;
         if (windows < 2) return res;
 
-        // coherence-weighted cross-spectrum (one-sided -> Hermitian full spectrum)
-        std::fill (work.begin(), work.end(), cplx {});
         weights.assign ((size_t) nb, cplx {});
-        const double gMax = windows < 4 ? 0.9 : 0.98;
-        for (int k = kLo; k <= kHi; ++k)
-        {
-            const double den = sxx[(size_t) k] * srr[(size_t) k];
-            const double mag = std::abs (sxr[(size_t) k]);
-            if (den <= 1e-30 || mag <= 1e-30) continue;
-            double g2 = std::min (gMax, mag * mag / den);
-            const double wgt = g2 / (1.0 - g2);
-            weights[(size_t) k] = sxr[(size_t) k] / mag * wgt;
-        }
-        for (int k = 0; k < nb; ++k)
-        {
-            work[(size_t) k] = weights[(size_t) k];
-            if (k > 0 && k < nfft / 2) work[(size_t) (nfft - k)] = std::conj (weights[(size_t) k]);
-        }
-        fft.run (work, true);   // c[n] = sum W_k e^{+j w n}
-
-        // coarse correlation over -maxLag..+maxLag
+        for (int k = kLo; k <= kHi; ++k) weights[(size_t) k] = weigh (total[(size_t) k], pxx[(size_t) k], prr[(size_t) k], k);
         const int L = std::min (maxLag, nfft / 2 - 1);
-        coarse.assign ((size_t) (2 * L + 1), 0.0);
-        double best = -1.0; int bestI = 0;
+        correlate (weights, L, coarse);
+        int bestI = 0; double best = -1.0;
         for (int t = -L; t <= L; ++t)
-        {
-            const double v = work[(size_t) ((t + nfft) % nfft)].real();
-            coarse[(size_t) (t + L)] = v;
-            if (std::abs (v) > best) { best = std::abs (v); bestI = t; }
-        }
+            if (std::abs (coarse[(size_t) (t + L)]) > best) { best = std::abs (coarse[(size_t) (t + L)]); bestI = t; }
         if (best <= 0.0) return res;
 
         const double lag = refine ((double) bestI);
@@ -212,19 +222,39 @@ public:
         res.lagSamples = lag;
         res.polarity = peak >= 0.0 ? 1 : -1;
 
-        // peak to "everything else" (outside +-0.3 ms of the peak)
+        // strongest other peak (outside +-0.3 ms): how much the answer stands out
         const int guard = std::max (2, (int) std::lround (0.0003 * sr));
-        double s2 = 0.0; int cnt = 0;
-        for (int t = -L; t <= L; ++t)
-            if (std::abs (t - bestI) > guard) { s2 += coarse[(size_t) (t + L)] * coarse[(size_t) (t + L)]; ++cnt; }
-        const double rmsRest = cnt > 0 ? std::sqrt (s2 / cnt) : 1e-30;
-        res.peakRatio = std::abs (peak) / std::max (rmsRest, 1e-30);
+        double second = 0.0;
+        for (int t = -L + 1; t < L; ++t)
+        {
+            const double a = std::abs (coarse[(size_t) (t + L)]);
+            if (std::abs (t - bestI) > guard && a >= std::abs (coarse[(size_t) (t + L - 1)]) && a >= std::abs (coarse[(size_t) (t + L + 1)]))
+                second = std::max (second, a);
+        }
+        res.peakRatio = second > 0.0 ? best / second : 10.0;
 
-        int agree = 0;
-        for (double l : perWindowLag) if (std::abs (l - lag) <= 1.5) ++agree;
-        res.agreement = perWindowLag.empty() ? 0.0 : (double) agree / (double) perWindowLag.size();
-        const double peakScore = std::clamp ((res.peakRatio - 4.0) / (12.0 - 4.0), 0.0, 1.0);
-        res.confidence = std::min (res.agreement, peakScore);
+        // the 6 groups of hits, each on its own: same lag (within 2 samples) and same polarity?
+        int agree = 0, groups = 0;
+        std::vector<double> sc;
+        for (int g = 0; g < kSubsets; ++g)
+        {
+            subW.assign ((size_t) nb, cplx {});
+            double e = 0.0;
+            for (int k = kLo; k <= kHi; ++k)
+            {
+                subW[(size_t) k] = weigh (sub[(size_t) g][(size_t) k], subXX[(size_t) g][(size_t) k], subRR[(size_t) g][(size_t) k], k);
+                e += std::abs (subW[(size_t) k]);
+            }
+            if (e <= 0.0) continue;
+            ++groups;
+            correlate (subW, L, sc);
+            int bi = 0; double bv = -1.0;
+            for (int t = -L; t <= L; ++t) if (std::abs (sc[(size_t) (t + L)]) > bv) { bv = std::abs (sc[(size_t) (t + L)]); bi = t; }
+            const int pol = sc[(size_t) (bi + L)] >= 0.0 ? 1 : -1;
+            if (std::abs ((double) bi - lag) <= 2.0 && pol == res.polarity) ++agree;
+        }
+        res.agreement = (double) agree / (double) kSubsets;
+        res.confidence = windows >= 2 * kSubsets ? res.agreement : 0.0;
 
         // alternate points: other strong local maxima of |c|, at least 0.25 ms apart
         res.points.push_back ({ lag, res.polarity, 1.0 });
@@ -251,69 +281,72 @@ public:
         return res;
     }
 
-private:
-    void analyseWindow()
+    // A-weighting (IEC 61672), as power: the sum is judged by how loud it sounds
+    static double aWeightPower (double f)
     {
-        // hits only: both tracks need signal, and transient content near their loudest so far
-        double ex = 0.0, er = 0.0, px = 0.0, pr = 0.0;
-        for (int i = 1; i < win; ++i)
+        const double f2 = f * f;
+        const double ra = (12194.0 * 12194.0 * f2 * f2)
+                        / ((f2 + 20.6 * 20.6) * std::sqrt ((f2 + 107.7 * 107.7) * (f2 + 737.9 * 737.9)) * (f2 + 12194.0 * 12194.0));
+        return ra * ra;
+    }
+
+private:
+    // half-whitened (divide by the 4th root of both power spectra: ringing drum tones no longer
+    // swamp the timing information, without blowing up noise like full whitening does), then A-weighted
+    cplx weigh (cplx sxr, double xx, double rr, int k) const
+    {
+        const double m = std::sqrt (std::sqrt (xx * rr));
+        return m > 1e-30 ? sxr / m * aw[(size_t) k] : cplx {};
+    }
+
+    void analyseWindow (long long s)
+    {
+        // both tracks need signal in this window (~ -80 dBFS rms), or it isn't a shared hit
+        double ex = 0.0, er = 0.0;
+        for (int i = 0; i < win; ++i)
         {
-            const double dx = (double) bufX[(size_t) i] - bufX[(size_t) (i - 1)];
-            const double dr = (double) bufR[(size_t) i] - bufR[(size_t) (i - 1)];
-            ex += dx * dx; er += dr * dr;
-            px += (double) bufX[(size_t) i] * bufX[(size_t) i];
-            pr += (double) bufR[(size_t) i] * bufR[(size_t) i];
+            const size_t h = (size_t) ((s + i) & (hist - 1));
+            ex += (double) histX[h] * histX[h];
+            er += (double) histR[h] * histR[h];
         }
-        maxEx = std::max (maxEx * 0.995, ex);
-        maxEr = std::max (maxEr * 0.995, er);
-        const double floor = 1e-8 * win;   // ~ -80 dBFS rms
-        if (px < floor || pr < floor) return;
-        if (ex < 0.05 * maxEx || er < 0.05 * maxEr) return;
+        if (ex < 1e-8 * win || er < 1e-8 * win) return;
 
         for (int i = 0; i < nfft; ++i)
         {
-            const double w = i < win ? hann[(size_t) i] : 0.0;
-            fx[(size_t) i] = i < win ? cplx (bufX[(size_t) i] * w, 0.0) : cplx {};
-            fr[(size_t) i] = i < win ? cplx (bufR[(size_t) i] * w, 0.0) : cplx {};
+            if (i < win)
+            {
+                const size_t h = (size_t) ((s + i) & (hist - 1));
+                fx[(size_t) i] = cplx (histX[h] * hann[(size_t) i], 0.0);
+                fr[(size_t) i] = cplx (histR[h] * hann[(size_t) i], 0.0);
+            }
+            else fx[(size_t) i] = fr[(size_t) i] = cplx {};
         }
         fft.run (fx, false);
         fft.run (fr, false);
-
-        // this window's own estimate (PHAT^0.8), for the agreement count
-        std::fill (work.begin(), work.end(), cplx {});
+        const size_t gi = (size_t) (windows % kSubsets);
+        auto& g = sub[gi]; auto& gx = subXX[gi]; auto& gr = subRR[gi];
         for (int k = kLo; k <= kHi; ++k)
         {
             const cplx c = fx[(size_t) k] * std::conj (fr[(size_t) k]);
-            sxr[(size_t) k] += c;
-            sxx[(size_t) k] += std::norm (fx[(size_t) k]);
-            srr[(size_t) k] += std::norm (fr[(size_t) k]);
-            const double m = std::abs (c);
-            if (m > 1e-30)
-            {
-                const cplx w = c / std::pow (m, 0.8);
-                work[(size_t) k] = w;
-                if (k < nfft / 2) work[(size_t) (nfft - k)] = std::conj (w);
-            }
+            const double xx = std::norm (fx[(size_t) k]), rr = std::norm (fr[(size_t) k]);
+            total[(size_t) k] += c; pxx[(size_t) k] += xx; prr[(size_t) k] += rr;
+            g[(size_t) k] += c; gx[(size_t) k] += xx; gr[(size_t) k] += rr;
+        }
+        ++windows;
+    }
+
+    // real correlation c[t] = sum W_k e^{+j w t} for t in -L..L
+    void correlate (const std::vector<cplx>& w, int L, std::vector<double>& out)
+    {
+        std::fill (work.begin(), work.end(), cplx {});
+        for (int k = 0; k < nb; ++k)
+        {
+            work[(size_t) k] = w[(size_t) k];
+            if (k > 0 && k < nfft / 2) work[(size_t) (nfft - k)] = std::conj (w[(size_t) k]);
         }
         fft.run (work, true);
-        const int L = std::min (maxLag, nfft / 2 - 1);
-        double best = -1.0; int bi = 0;
-        for (int t = -L; t <= L; ++t)
-        {
-            const double v = std::abs (work[(size_t) ((t + nfft) % nfft)].real());
-            if (v > best) { best = v; bi = t; }
-        }
-        // parabolic sub-sample
-        auto at = [&] (int t) { return std::abs (work[(size_t) ((t + nfft) % nfft)].real()); };
-        double frac = 0.0;
-        if (bi > -L && bi < L)
-        {
-            const double a = at (bi - 1), b = at (bi), c = at (bi + 1);
-            const double d = a - 2.0 * b + c;
-            if (std::abs (d) > 1e-30) frac = std::clamp (0.5 * (a - c) / d, -0.5, 0.5);
-        }
-        perWindowLag.push_back (bi + frac);
-        ++windows;
+        out.assign ((size_t) (2 * L + 1), 0.0);
+        for (int t = -L; t <= L; ++t) out[(size_t) (t + L)] = work[(size_t) ((t + nfft) % nfft)].real();
     }
 
     // band-limited correlation at a fractional lag (exact interpolation of the weighted spectrum)
@@ -347,14 +380,19 @@ private:
     }
 
     double sr = 48000.0;
-    int maxLag = 1440, win = 8192, hop = 4096, nfft = 16384, nb = 8193, kLo = 1, kHi = 8000;
-    int fill = 0, windows = 0;
-    double maxEx = 0.0, maxEr = 0.0;
+    int maxLag = 1440, win = 8192, nfft = 16384, nb = 8193, kLo = 1, kHi = 8000, hist = 32768;
+    long long n = 0, lastOnset = 0, refractory = 3840, preRoll = 1920;
+    int windows = 0, nPending = 0;
+    double env = 0.0, level = 0.0, holdDecay = 0.99, levelDecay = 0.9999;
+    float prevR = 0.0f;
+    bool above = false;
+    std::array<long long, 64> pending {};
     Fft fft;
-    std::vector<float> bufX, bufR;
-    std::vector<double> hann, sxx, srr, coarse;
-    std::vector<cplx> sxr, fx, fr, work, weights;
-    std::vector<double> perWindowLag;
+    std::vector<float> histX, histR;
+    std::vector<double> hann, aw, coarse, pxx, prr;
+    std::array<std::vector<double>, kSubsets> subXX, subRR;
+    std::vector<cplx> total, fx, fr, work, weights, subW;
+    std::array<std::vector<cplx>, kSubsets> sub;
 };
 
 //------------------------------------------------------------------------------
@@ -427,8 +465,8 @@ public:
         int id = 0;                  // increments with every finished ALIGN (so a result is applied once)
     };
 
-    static constexpr int    kMinWindows    = 24;     // hits before it may finish on its own (~4-5 s of drums)
-    static constexpr double kDoneAgreement = 0.7;
+    static constexpr int    kMinWindows    = 36;     // hits before it may finish on its own
+    static constexpr double kDoneAgreement = 0.83;   // 5 of the 6 groups agree
     static constexpr double kMaxSeconds    = 120.0;  // stops listening after this much audio
 
     ~AlignAnalyzer() { shutdown(); }
@@ -566,14 +604,14 @@ private:
         const double byHits = std::min (1.0, (double) r.windows / kMinWindows);
         status.progress = std::max (status.progress, std::min (0.99, byHits * std::max (0.25, r.agreement / kDoneAgreement)));
 
-        const bool confident = r.valid && r.windows >= kMinWindows && r.agreement >= kDoneAgreement && r.confidence >= 0.6 && stableCount >= 2;
+        const bool confident = r.valid && r.windows >= kMinWindows && r.confidence >= kDoneAgreement && stableCount >= 2;
         const bool timeUp = status.heardSeconds >= kMaxSeconds;
         // playback stopped (~1.5 s without audio) and it already has a good answer: finish
-        const bool stoppedButSure = quietPasses >= 60 && r.valid && r.windows >= kMinWindows && r.confidence >= 0.6;
+        const bool stoppedButSure = quietPasses >= 60 && r.valid && r.windows >= 2 * PairEstimator::kSubsets && r.confidence >= 0.66;
         if (confident || stopReq || timeUp || stoppedButSure)
         {
             listening.store (false, std::memory_order_release);
-            const bool ok = r.valid && r.confidence >= 0.5 && r.windows >= 4;
+            const bool ok = r.valid && r.confidence >= 0.66;   // at least 4 of the 6 groups agree
             status.state = ok ? State::done : State::notSure;
             status.progress = 1.0;
             ++status.id;
