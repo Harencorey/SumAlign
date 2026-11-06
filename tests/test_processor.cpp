@@ -49,7 +49,7 @@ static void testLatencyBypassAndDelay()
         SumAlignProcessor p;
         setLayout (p, AudioChannelSet::stereo(), AudioChannelSet::disabled());
         p.prepareToPlay (sr, 128);
-        const int L = (int) std::lround (0.010 * sr) + sa::kInterpHalf;
+        const int L = (int) std::lround (0.030 * sr) + sa::kInterpHalf;
         CHECK (p.getLatencySamples() == L, "sr %.0f latency %d, expected %d", sr, p.getLatencySamples(), L);
 
         // an impulse comes out exactly L (+ delay) samples later, in normal and bypassed processing
@@ -61,7 +61,7 @@ static void testLatencyBypassAndDelay()
             AudioBuffer<float> buf (2, 128);
             MidiBuffer midi;
             int found = -1;
-            for (int blk = 0; blk < 40 && found < 0; ++blk)
+            for (int blk = 0; blk < 100 && found < 0; ++blk)
             {
                 buf.clear();
                 if (blk == 0) { buf.setSample (0, 5, 1.0f); buf.setSample (1, 5, 1.0f); }

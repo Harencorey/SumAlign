@@ -22,7 +22,7 @@ namespace sa
 {
 
 constexpr double kPi          = 3.14159265358979323846;
-constexpr double kMaxShiftMs  = 10.0;   // delay range: -10 ms ... +10 ms
+constexpr double kMaxShiftMs  = 30.0;   // delay range: -30 ms ... +30 ms (room mics up to ~10 m)
 constexpr int    kTaps        = 64;     // windowed-sinc length (fractional part only)
 constexpr int    kHalf        = kTaps / 2;
 constexpr int    kInterpHalf  = kHalf - 1;   // samples of "look-ahead" the interpolator needs

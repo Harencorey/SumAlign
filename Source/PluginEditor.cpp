@@ -215,7 +215,7 @@ SumAlignEditor::SumAlignEditor (SumAlignProcessor& p)
     setLookAndFeel (&look);
 
     makeKnob (delay, sa::pid::delay, "DELAY",
-              "Moves this track later (+) or earlier (-), up to 10 ms either way, in fractions of a sample. "
+              "Moves this track later (+) or earlier (-), up to 30 ms either way, in fractions of a sample. "
               "Shift-click and drag for fine moves; double-click for 0; click the number to type a value.", 0.0);
     makeKnob (phase, sa::pid::phase, "PHASE",
               "Rotates the phase, like the Little Labs IBP: 0 = untouched, 180 = fully flipped above the Phase Center. "

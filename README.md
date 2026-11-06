@@ -26,7 +26,7 @@ Every past version stays downloadable at https://github.com/Harencorey/sumalign/
 
 | Control | What it does |
 |---|---|
-| **Delay** | Moves the track later (+) or earlier (-), up to 10 ms each way, in fractions of a sample. The line under it shows the same move in samples, cm and inches (343 m/s). Shift-click-drag = fine; double-click = 0; click the number to type a value. |
+| **Delay** | Moves the track later (+) or earlier (-), up to 30 ms each way (about 10 m: far enough for room mics), in fractions of a sample. The line under it shows the same move in samples, cm and inches (343 m/s). Shift-click-drag = fine; double-click = 0; click the number to type a value. |
 | **Nudge** | Moves the delay by 1 or 0.1 sample. **0** resets it. Whole-sample values are a plain sample copy (no interpolation at all). |
 | **Phase** | Rotates the phase, like the Little Labs IBP: 0 = untouched; the angle is exact at the Phase Center. It's a 1st-order all-pass: the level never changes, the phase goes from 0 at the bottom of the spectrum towards 180 at the top (see the curve). 0 is bit-identical to off. Shift-drag for fine moves. |
 | **Center** | The Phase Center: the frequency the Phase knob's angle applies to (20 Hz - 8 kHz). Low for kick/bass/toms, higher for snare, guitars, vocals. |
@@ -40,7 +40,7 @@ in -> fractional delay (64-tap Kaiser-windowed sinc) -> phase rotation (1st-orde
 sidechain -> fixed latency -> correlation meter
 ```
 
-- **Latency:** fixed at 10 ms + 31 samples (511 samples at 48 kHz), the same on every instance and every setting, reported
+- **Latency:** fixed at 30 ms + 31 samples (1471 samples at 48 kHz), the same on every instance and every setting, reported
   to the host. That's what lets Delay go negative (move a track earlier). Bypass keeps the same latency.
 - **Delay accuracy:** fractional delays land within -100 dB of the ideal delayed signal up to 16 kHz at 44.1 kHz.
   Moving the delay crossfades between the old and new setting over 10 ms (no zipper noise, no pitch bend).

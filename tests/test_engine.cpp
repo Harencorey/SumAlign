@@ -139,7 +139,7 @@ static void testLatencyAndZeroDelay()
         sa::AlignEngine e;
         auto out = run (in, {}, sr, 512, nullptr, {}, false, &e);
         const int L = e.latencySamples();
-        CHECK (L == (int) std::lround (0.01 * sr) + sa::kInterpHalf, "latency %d at %.0f", L, sr);
+        CHECK (L == (int) std::lround (0.03 * sr) + sa::kInterpHalf, "latency %d at %.0f", L, sr);
         bool exact = true;
         for (int c = 0; c < 2; ++c)
             for (size_t i = 0; i < n; ++i)
