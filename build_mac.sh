@@ -12,10 +12,11 @@ JUCE_ARG=()
 if [ $# -ge 1 ]; then JUCE_ARG=(-DJUCE_DIR="$1"); fi
 
 cmake -B build-mac -DCMAKE_BUILD_TYPE=Release "${JUCE_ARG[@]+"${JUCE_ARG[@]}"}"
-cmake --build build-mac --config Release --target SumAlign_AU SumAlign_VST3 SumAlign_Standalone AlignTests AlignProcessorTests -j "$(sysctl -n hw.ncpu)"
+cmake --build build-mac --config Release --target SumAlign_AU SumAlign_VST3 SumAlign_Standalone AlignTests AnalysisTests AlignProcessorTests -j "$(sysctl -n hw.ncpu)"
 
 echo "Running tests..."
 ./build-mac/AlignTests
+./build-mac/AnalysisTests
 ./build-mac/AlignProcessorTests_artefacts/Release/AlignProcessorTests
 
 killall -9 AudioComponentRegistrar 2>/dev/null || true

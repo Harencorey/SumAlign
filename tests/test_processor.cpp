@@ -127,6 +127,65 @@ static void testState()
     CHECK (std::abs (f->convertFrom0to1 (f->getValueForText ("1.2 kHz")) - 1200.0f) < 0.5f, "typing 1.2 kHz");
 }
 
+static void testAlign()
+{
+    std::printf ("ALIGN end to end: listens to the raw input vs the sidechain, then sets Delay + Polarity\n");
+    const double sr = 48000.0;
+    const double lag = 333.37;   // this mic hears the source 6.95 ms later, inverted
+    SumAlignProcessor p;
+    setLayout (p, AudioChannelSet::stereo(), AudioChannelSet::mono());
+    setParam (p, sa::pid::delay, 4.0f);   // a wrong manual setting first: ALIGN measures the raw input anyway
+    p.prepareToPlay (sr, 512);
+
+    // drum-like source
+    const int n = (int) (25 * sr);
+    std::vector<float> src ((size_t) n + 4096, 0.0f);
+    Random rng (11);
+    for (int at = 2000; at < n; at += (int) (sr * (0.25 + 0.2 * rng.nextFloat())))
+        for (int i = 0; i < (int) (0.3 * sr) && at + i < n; ++i)
+        {
+            const double t = i / sr;
+            src[(size_t) (at + i)] += (float) (0.5 * std::exp (-t / 0.1) * std::sin (2 * MathConstants<double>::pi * 160 * t)
+                                               + 0.4 * std::exp (-t / 0.004) * (rng.nextFloat() * 2 - 1));
+        }
+    sa::Taps tap; tap.design (lag + sa::kInterpHalf);
+
+    p.alignPressed();
+    AudioBuffer<float> buf (3, 512);
+    MidiBuffer midi;
+    for (int pos = 4096; pos + 512 < n; pos += 512)
+    {
+        for (int i = 0; i < 512; ++i)
+        {
+            double acc = 0;
+            for (int k = 0; k < sa::kTaps; ++k)
+                acc += tap.h[(size_t) k] * src[(size_t) (pos + i - tap.whole - (k - sa::kInterpHalf) + sa::kInterpHalf)];
+            buf.setSample (0, i, (float) -acc); buf.setSample (1, i, (float) -acc);
+            buf.setSample (2, i, src[(size_t) (pos + i)]);
+        }
+        p.processBlock (buf, midi);
+        if ((pos / 512) % 8 == 0) Thread::sleep (1);
+        if (p.alignStatus().state != sa::AlignAnalyzer::State::listening) break;
+    }
+    for (int i = 0; i < 300 && p.alignStatus().state == sa::AlignAnalyzer::State::listening; ++i) Thread::sleep (10);
+    p.checkAlign();
+    const auto st = p.alignStatus();
+    CHECK (st.state == sa::AlignAnalyzer::State::done, "ALIGN state %d (conf %.2f agree %.2f peak %.1f hits %d lag %.3f)", (int) st.state, st.result.confidence, st.result.agreement, st.result.peakRatio, st.result.windows, st.result.lagSamples);
+    const float wantMs = (float) (-lag * 1000.0 / sr);
+    const float gotMs = p.apvts.getRawParameterValue (sa::pid::delay)->load();
+    CHECK (std::abs (gotMs - wantMs) * sr / 1000.0 < 0.05, "Delay %.4f ms, want %.4f (%.3f samples off)", gotMs, wantMs, (gotMs - wantMs) * sr / 1000.0);
+    CHECK (p.apvts.getRawParameterValue (sa::pid::invert)->load() > 0.5f, "Polarity not flipped");
+    CHECK (p.currentPointIndex() == 0 && p.alignPoints().size() >= 1, "points: %d, current %d", (int) p.alignPoints().size(), p.currentPointIndex());
+    std::printf ("  set Delay %.4f ms (want %.4f), polarity %s, %.0f %% sure after %.1f s\n", gotMs, wantMs,
+                 p.apvts.getRawParameterValue (sa::pid::invert)->load() > 0.5f ? "flipped" : "normal", st.result.confidence * 100, st.heardSeconds);
+
+    // the points survive save/load
+    MemoryBlock mb; p.getStateInformation (mb);
+    SumAlignProcessor q; q.setStateInformation (mb.getData(), (int) mb.getSize());
+    q.prepareToPlay (sr, 512);
+    CHECK (q.alignPoints().size() == p.alignPoints().size() && q.currentPointIndex() == 0, "points not restored");
+}
+
 static void testEditor()
 {
     std::printf ("Editor opens and closes\n");
@@ -144,6 +203,7 @@ int main()
     testLatencyBypassAndDelay();
     testReferenceMeter();
     testState();
+    testAlign();
     testEditor();
     if (failures == 0) std::printf ("\nALL PROCESSOR TESTS PASSED\n");
     else               std::printf ("\n%d FAILURE(S)\n", failures);

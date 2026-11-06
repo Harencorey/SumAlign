@@ -46,6 +46,23 @@ private:
 };
 
 //==============================================================================
+// ALIGN status: progress while listening, then what it found (or why it isn't sure).
+class AlignStatusView : public juce::Component
+{
+public:
+    explicit AlignStatusView (SumAlignProcessor& p) : proc (p) {}
+    void update();
+    void paint (juce::Graphics&) override;
+private:
+    SumAlignProcessor& proc;
+    sa::AlignAnalyzer::Status st;
+    bool ref = false;
+    juce::String line1, line2;
+    float progress = 0.0f;
+    bool listening = false;
+};
+
+//==============================================================================
 class SumAlignLook : public juce::LookAndFeel_V4
 {
 public:
@@ -92,9 +109,13 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> invertAtt;
     PhaseCurve curve;
     CorrelationMeter meter;
+    juce::TextButton alignButton { "ALIGN" };
+    juce::TextButton earlierPoint { juce::CharPointer_UTF8 ("\xe2\x97\x80  EARLIER") }, laterPoint { juce::CharPointer_UTF8 ("LATER  \xe2\x96\xb6") };
+    juce::Label pointLabel;
+    AlignStatusView alignStatus;
     juce::TooltipWindow tooltips { this, 3000 };
 
-    juce::Rectangle<int> delayArea, phaseArea, outArea;
+    juce::Rectangle<int> delayArea, phaseArea, outArea, alignArea;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SumAlignEditor)
 };

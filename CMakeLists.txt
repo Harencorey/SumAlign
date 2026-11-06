@@ -77,6 +77,16 @@ if(SA_BUILD_TESTS)
     endif()
     add_test(NAME engine COMMAND AlignTests)
 
+    # ALIGN analysis tests: plain C++, no JUCE.
+    add_executable(AnalysisTests tests/test_analysis.cpp)
+    target_include_directories(AnalysisTests PRIVATE Source)
+    find_package(Threads REQUIRED)
+    target_link_libraries(AnalysisTests PRIVATE Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(AnalysisTests PRIVATE -Wno-mismatched-new-delete)
+    endif()
+    add_test(NAME analysis COMMAND AnalysisTests)
+
     # Plug-in level tests: the real processor, driven like a host drives it.
     juce_add_console_app(AlignProcessorTests PRODUCT_NAME "AlignProcessorTests")
     target_sources(AlignProcessorTests PRIVATE

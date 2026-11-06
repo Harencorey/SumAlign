@@ -3,13 +3,15 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "AlignCore.h"
+#include "AlignAnalysis.h"
 #include "Params.h"
 
-class SumAlignProcessor : public juce::AudioProcessor
+class SumAlignProcessor : public juce::AudioProcessor,
+                          private juce::Timer
 {
 public:
     SumAlignProcessor();
-    ~SumAlignProcessor() override = default;
+    ~SumAlignProcessor() override;
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
@@ -49,7 +51,28 @@ public:
     // Moves the Delay parameter by a number of samples at the current rate (UI nudge buttons).
     void nudgeDelaySamples (double samples);
 
+    //--- ALIGN (message thread) -----------------------------------------------------------
+    // Press: start listening; press while listening: finish now with what's been heard.
+    void alignPressed();
+    sa::AlignAnalyzer::Status alignStatus() const { return analyzer.getStatus(); }
+    bool referenceConnected() const noexcept { return engine.refPresent.load(); }
+
+    // Alternate points from the last ALIGN (sorted by delay). Earlier/Later step through them.
+    struct Point { double delayMs; bool invert; double strength; };
+    std::vector<Point> alignPoints() const;
+    int  currentPointIndex() const;          // the point the current Delay/Polarity sits on, or -1
+    void stepPoint (int direction);           // -1 = earlier, +1 = later
+    void checkAlign() { timerCallback(); }    // what the timer does (tests call it directly)
+
 private:
+    void timerCallback() override;            // applies a finished ALIGN to Delay + Polarity
+    void applyPoint (const Point&);
+    void storePoints (const std::vector<Point>&);
+
+    sa::AlignAnalyzer analyzer;
+    int appliedId = 0;
+    std::vector<float> capX, capR;            // mono mixes for the capture (sized in prepareToPlay)
+
     struct Raw { std::atomic<float>* delay {}, * invert {}, * phase {}, * phaseCenter {}; } raw;
     std::atomic<double> rate { 48000.0 };
 

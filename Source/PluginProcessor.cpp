@@ -60,6 +60,16 @@ SumAlignProcessor::SumAlignProcessor()
 
     engine.prepare (48000.0, 2);
     setLatencySamples (engine.latencySamples());
+    analyzer.prepare (48000.0, engine.maxShiftSamples());
+    capX.assign (4096, 0.0f);
+    capR.assign (4096, 0.0f);
+    startTimerHz (15);
+}
+
+SumAlignProcessor::~SumAlignProcessor()
+{
+    stopTimer();
+    analyzer.shutdown();
 }
 
 bool SumAlignProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -91,13 +101,16 @@ sa::Settings SumAlignProcessor::readSettings() const noexcept
     return s;
 }
 
-void SumAlignProcessor::prepareToPlay (double sampleRate, int)
+void SumAlignProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     rate.store (sampleRate);
     engine.prepare (sampleRate, 2);
     engine.setSettings (readSettings());
     engine.reset();
     setLatencySamples (engine.latencySamples());   // fixed for a given sample rate
+    analyzer.prepare (sampleRate, engine.maxShiftSamples());   // cancels a running ALIGN
+    capX.assign ((size_t) jmax (4096, samplesPerBlock), 0.0f);
+    capR.assign ((size_t) jmax (4096, samplesPerBlock), 0.0f);
 }
 
 void SumAlignProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
@@ -121,6 +134,26 @@ void SumAlignProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
             sc = getBusBuffer (buffer, true, 1);
             scCh = sc.getNumChannels();
             scPtrs = scCh > 0 ? sc.getArrayOfReadPointers() : nullptr;
+        }
+    }
+
+    // ALIGN listens to the raw input (before this plug-in moves it) against the raw reference
+    if (analyzer.isListening() && scCh > 0 && numCh > 0)
+    {
+        const float* const* in = main.getArrayOfReadPointers();
+        for (int pos = 0; pos < n;)
+        {
+            const int len = jmin (n - pos, (int) capX.size());
+            for (int i = 0; i < len; ++i)
+            {
+                float x = 0.0f, r = 0.0f;
+                for (int c = 0; c < numCh; ++c) x += in[c][pos + i];
+                for (int c = 0; c < scCh; ++c)  r += scPtrs[c][pos + i];
+                capX[(size_t) i] = x;
+                capR[(size_t) i] = r;
+            }
+            analyzer.push (capX.data(), capR.data(), len);
+            pos += len;
         }
     }
 
@@ -148,6 +181,96 @@ void SumAlignProcessor::nudgeDelaySamples (double samples)
     p->beginChangeGesture();
     p->setValueNotifyingHost (p->convertTo0to1 (clamped));
     p->endChangeGesture();
+}
+
+//==============================================================================
+void SumAlignProcessor::alignPressed()
+{
+    const auto st = analyzer.getStatus();
+    if (st.state == sa::AlignAnalyzer::State::listening) analyzer.finishNow();
+    else analyzer.start();
+}
+
+void SumAlignProcessor::timerCallback()
+{
+    const auto st = analyzer.getStatus();
+    if (st.id == appliedId) return;
+    appliedId = st.id;
+    if (st.state != sa::AlignAnalyzer::State::done || ! st.result.valid) return;   // "not sure": change nothing
+
+    const double r = rate.load();
+    std::vector<Point> pts;
+    for (const auto& p : st.result.points)
+    {
+        const double ms = -p.lagSamples * 1000.0 / r;
+        if (std::abs (ms) <= sa::kMaxShiftMs) pts.push_back ({ ms, p.polarity < 0, p.strength });
+    }
+    if (pts.empty()) return;
+    applyPoint (pts.front());   // the strongest
+    std::sort (pts.begin(), pts.end(), [] (const Point& a, const Point& b) { return a.delayMs < b.delayMs; });
+    storePoints (pts);
+    apvts.state.setProperty ("alignConfidence", st.result.confidence, nullptr);
+}
+
+void SumAlignProcessor::applyPoint (const Point& p)
+{
+    auto set = [] (RangedAudioParameter* prm, float v)
+    {
+        prm->beginChangeGesture();
+        prm->setValueNotifyingHost (prm->convertTo0to1 (v));
+        prm->endChangeGesture();
+    };
+    set (apvts.getParameter (sa::pid::delay), (float) p.delayMs);
+    set (apvts.getParameter (sa::pid::invert), p.invert ? 1.0f : 0.0f);
+}
+
+// Saved with the session (as text), so Earlier/Later still work after reopening it.
+void SumAlignProcessor::storePoints (const std::vector<Point>& pts)
+{
+    StringArray items;
+    for (auto& p : pts) items.add (String (p.delayMs, 6) + ":" + (p.invert ? "1" : "0") + ":" + String (p.strength, 3));
+    apvts.state.setProperty ("alignPoints", items.joinIntoString (";"), nullptr);
+}
+
+std::vector<SumAlignProcessor::Point> SumAlignProcessor::alignPoints() const
+{
+    std::vector<Point> pts;
+    StringArray items;
+    items.addTokens (apvts.state.getProperty ("alignPoints").toString(), ";", "");
+    for (auto& it : items)
+    {
+        StringArray f; f.addTokens (it, ":", "");
+        if (f.size() == 3) pts.push_back ({ f[0].getDoubleValue(), f[1] == "1", f[2].getDoubleValue() });
+    }
+    return pts;
+}
+
+int SumAlignProcessor::currentPointIndex() const
+{
+    const auto pts = alignPoints();
+    const double now = (double) raw.delay->load();
+    const double tol = 0.5 * 1000.0 / rate.load();   // half a sample
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (std::abs (pts[i].delayMs - now) <= tol) return (int) i;
+    return -1;
+}
+
+void SumAlignProcessor::stepPoint (int direction)
+{
+    const auto pts = alignPoints();
+    if (pts.empty()) return;
+    const double now = (double) raw.delay->load();
+    const double tol = 0.5 * 1000.0 / rate.load();
+    if (direction < 0)
+    {
+        for (int i = (int) pts.size() - 1; i >= 0; --i)
+            if (pts[(size_t) i].delayMs < now - tol) { applyPoint (pts[(size_t) i]); return; }
+    }
+    else
+    {
+        for (auto& p : pts)
+            if (p.delayMs > now + tol) { applyPoint (p); return; }
+    }
 }
 
 //==============================================================================

@@ -18,21 +18,17 @@ int main (int argc, char** argv)
     SumAlignProcessor p;
     auto set = [&] (const char* id, float v) { auto* q = p.apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v)); };
     const int lag = 61;   // this mic is ~43 cm further from the source
-    if (aligned)
-    {
-        set (sa::pid::delay, (float) (-lag * 1000.0 / sr));
-        set (sa::pid::phaseCenter, 120.0f);
-    }
+    set (sa::pid::phaseCenter, 120.0f);
     p.prepareToPlay (sr, 256);
 
     // kick-like hits into both mics; this one hears them lag samples later
-    const int n = (int) (sr * 3);
+    const int n = (int) (sr * 12);
     std::vector<float> src ((size_t) n + 4096, 0.0f);
     std::mt19937 rng (5);
     std::uniform_real_distribution<float> u (-1.0f, 1.0f);
-    for (int hit = 0; hit < 12; ++hit)
+    for (int hit = 0; hit < 46; ++hit)
     {
-        const int at = 2048 + hit * (int) (sr * 0.25);
+        const int at = 2048 + hit * (int) (sr * 0.25) + (int) (u (rng) * 800.0f);
         for (int i = 0; i < (int) (sr * 0.2) && at + i < (int) src.size(); ++i)
         {
             const double t = i / sr;
@@ -42,6 +38,7 @@ int main (int argc, char** argv)
         }
     }
 
+    if (aligned) p.alignPressed();   // let ALIGN find it
     std::unique_ptr<AudioProcessorEditor> ed (p.createEditor());
     ed->setVisible (true);
     auto* sed = dynamic_cast<SumAlignEditor*> (ed.get());
@@ -57,6 +54,8 @@ int main (int argc, char** argv)
             blk.setSample (2, i, ref); blk.setSample (3, i, ref);
         }
         p.processBlock (blk, midi);
+        if ((pos / 256) % 16 == 0) Thread::sleep (2);
+        p.checkAlign();
         if (sed != nullptr) sed->refresh();
     }
 

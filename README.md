@@ -4,8 +4,8 @@ Phase alignment for multi-mic sources: kick in/out, snare top/bottom vs overhead
 Put it on the tracks you want to line up and dial in **time**, **phase** and **polarity** against a reference.
 The meter shows how well this track sums with the reference.
 
-**Status: Phase 1 (manual core).** One-click ALIGN comes in Phase 2 (sidechain, one pair at a time) and Phase 3
-(every instance in the session finds the others). The full plan is in the Plugin Creation project (`phase-align-plan.md`).
+**Status: Phase 2 (ALIGN through the sidechain, one pair at a time).** Phase 3 makes it one click for the whole
+session (every instance finds the others, no sidechain routing). The full plan is in the Plugin Creation project (`phase-align-plan.md`).
 
 ## Install (easiest)
 
@@ -14,13 +14,16 @@ It isn't Apple-notarized yet, so the first time macOS blocks it: **System Settin
 (or right-click the .pkg and choose **Open**). Rescan plug-ins and look for **Norka DSP > SumAlign**.
 Every past version stays downloadable at https://github.com/Harencorey/sumalign/releases.
 
-## Using it (Phase 1)
+## Using it
 
 1. Insert SumAlign on the track you want to move (e.g. the overheads, or kick out).
 2. Route the **reference** (e.g. the snare top or kick in) into SumAlign's **sidechain**. Don't put SumAlign on the
    reference track for now (or leave it at its defaults: Delay 0, Phase 0, Polarity off).
-3. Play the part. Move **Delay**, then try **Polarity**, then the **Phase** knob for the highest **SUM vs REFERENCE**
-   number. Then listen: the meter gets you close, your ears decide.
+3. Press **ALIGN** and play the song (the whole song is best; a few seconds of drums is usually enough). It shows
+   progress while it listens and sets **Delay** and **Polarity** when it's sure. Press it again (FINISH) to stop early.
+   If it isn't sure, it changes nothing and tells you why.
+4. Optional: **Earlier / Later** jump to other points where the track also lines up (e.g. keep some of a room mic's
+   distance while staying in phase). Then fine-tune by ear with **Phase**, and check the **SUM vs REFERENCE** meter.
 
 ## Controls
 
@@ -32,6 +35,22 @@ Every past version stays downloadable at https://github.com/Harencorey/sumalign/
 | **Center** | The Phase Center: the frequency the Phase knob's angle applies to (20 Hz - 8 kHz). Low for kick/bass/toms, higher for snare, guitars, vocals. |
 | **Invert** | Polarity flip. Switching ramps through zero over 10 ms, so it never clicks. |
 | **SUM vs REFERENCE** | Correlation of this track's output with the sidechain, -1 (cancelling) .. +1 (summing). Weighted towards the mids and highs (a +6 dB/oct tilt), where misalignment shows up as comb filtering; broadband correlation on a kick or bass would barely move. Averaged over ~300 ms. |
+
+## ALIGN: how it measures
+
+- It listens to this track's **raw input** (before SumAlign moves it) and the sidechain, on a background thread
+  (the audio thread only copies samples into a lock-free buffer; it never waits or allocates).
+- It uses only the moments where both tracks have real, transient-rich signal (hits), cut into windows ~4x the
+  delay range long, and accumulates the cross-spectrum over all of them.
+- Coherence weighting: frequencies both mics really share count most; bleed, noise and one-mic-only content count
+  little. The correlation peak is then refined to a fraction of a sample by exact band-limited interpolation, and
+  its sign gives the polarity.
+- **Sure** = the fraction of single hits that agree on the same lag (within 1.5 samples), capped by how far the peak
+  stands out. It finishes by itself after at least 24 hits once it's 70 %+ sure and stable, when playback stops and
+  it already has a good answer, or after 2 minutes.
+- Other strong peaks become the **Earlier / Later** points (saved with the session).
+- Tested on synthetic mic pairs with HF loss, a room reflection, bleed from another source and noise: worst error
+  0.87 microseconds (~0.3 mm) over 44.1-192 kHz, lags across the full +-30 ms, both polarities.
 
 ## How it works
 
@@ -62,11 +81,15 @@ sidechain -> fixed latency -> correlation meter
   - correlation meter readings (incl. a bass-heavy source 1.3 ms late: 0.05 vs 1.00 aligned)
   - no allocations
   - silence and an extreme impulse
+- `tests/test_analysis.cpp`: ALIGN on synthetic mic pairs (fractional lags in both directions at 4 sample rates,
+  polarity, kick in/out, unrelated and silent tracks = "not sure", alternate points, the real background thread,
+  no allocations in the audio thread's capture).
 - `tests/test_processor.cpp`:
   - bus layouts
   - reported latency and impulse timing in normal / bypassed / shifted processing at 44.1 - 192 kHz
   - the sidechain driving the meter
   - session save/load and typed values
+  - ALIGN end to end through the real processor (Delay and Polarity set, points saved with the session)
   - the editor opening
 
 ## Build it yourself (Mac)
@@ -86,6 +109,8 @@ then the **latest** release plus a permanent version release. Other branches pub
 ## Files
 
 - `Source/AlignCore.h`: the whole audio path (plain C++, shared by the plug-in and the tests).
+- `Source/AlignAnalysis.h`: ALIGN (FFT, capture ring, pair estimator, background analyzer). Plain C++, no JUCE: it's
+  the part that gets ported to The Gate later.
 - `Source/Params.h`: parameter IDs (don't rename after release: it breaks sessions). Plug-in code `SmAl`, manufacturer `Nrka`: keep forever.
 - `Source/PluginProcessor.*`, `Source/PluginEditor.*`: JUCE wrapper and UI.
 - `tools/Snapshot.cpp`: renders the real editor to a PNG (`-DSA_BUILD_TOOLS=ON`).

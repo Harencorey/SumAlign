@@ -209,8 +209,74 @@ void CorrelationMeter::paint (Graphics& g)
 }
 
 //==============================================================================
+void AlignStatusView::update()
+{
+    st = proc.alignStatus();
+    ref = proc.referenceConnected();
+    using S = sa::AlignAnalyzer::State;
+    listening = st.state == S::listening;
+    progress = (float) st.progress;
+    String a, b;
+    const double rate = proc.currentSampleRate();
+    const auto& r = st.result;
+    if (st.state == S::listening)
+    {
+        if (! ref)                        { a = "Listening... but no reference on the sidechain."; b = "Route the reference track into SumAlign's sidechain."; }
+        else if (st.heardSeconds < 0.05)  { a = "Listening... press play."; b = "Play the song (the whole song is best). Click ALIGN again to finish early."; }
+        else
+        {
+            a = "Listening... " + String (r.windows) + " hits, " + String (roundToInt (st.progress * 100.0)) + " %";
+            b = r.valid ? "So far: " + String (-r.lagSamples * 1000.0 / rate, 3) + " ms, " + String (roundToInt (r.confidence * 100.0)) + " % sure. Click ALIGN to finish now."
+                        : "Waiting for hits that both mics hear.";
+        }
+    }
+    else if (st.state == S::done)
+    {
+        const double ms = -r.lagSamples * 1000.0 / rate;
+        const double cm = std::abs (ms) * 0.1 * sa::kSpeedOfSound;
+        a = String ("Aligned: ") + String (roundToInt (r.confidence * 100.0)) + " % sure (" + String (r.windows) + " hits)";
+        b = "This track was " + String (std::abs (ms), 3) + " ms (" + String (cm, 1) + " cm) " + (ms <= 0 ? "late" : "early")
+          + (r.polarity < 0 ? ", and inverted." : ".") + " Delay and Polarity are set; Phase is yours.";
+    }
+    else if (st.state == S::notSure)
+    {
+        if (r.windows == 0) { a = "Nothing changed: no hits heard on both tracks."; b = "Is the reference on the sidechain, and was the song playing?"; }
+        else
+        {
+            a = "Nothing changed: only " + String (roundToInt (r.confidence * 100.0)) + " % sure.";
+            b = "These two tracks don't share enough of the same sound. Try a part where both mics clearly hear the same hits.";
+        }
+    }
+    else
+    {
+        a = ref ? "Press ALIGN, then play the song." : "Route the reference track (e.g. the close mic) into the sidechain.";
+        b = ref ? "SumAlign listens to both tracks and sets Delay and Polarity for you." : "Then press ALIGN and play the song.";
+    }
+    if (a != line1 || b != line2 || listening) { line1 = a; line2 = b; repaint(); }
+}
+
+void AlignStatusView::paint (Graphics& g)
+{
+    auto b = getLocalBounds().toFloat();
+    g.setColour (colours::text);
+    g.setFont (FontOptions (13.0f, Font::bold));
+    g.drawText (line1, b.removeFromTop (18.0f), Justification::centredLeft);
+    g.setColour (colours::dim);
+    g.setFont (FontOptions (11.5f));
+    g.drawFittedText (line2, b.removeFromTop (30.0f).toNearestInt(), Justification::topLeft, 2);
+    if (listening)
+    {
+        auto bar = b.removeFromTop (6.0f).withTrimmedTop (1.0f);
+        g.setColour (colours::bg);
+        g.fillRoundedRectangle (bar, 2.0f);
+        g.setColour (colours::accent);
+        g.fillRoundedRectangle (bar.withWidth (jmax (4.0f, bar.getWidth() * progress)), 2.0f);
+    }
+}
+
+//==============================================================================
 SumAlignEditor::SumAlignEditor (SumAlignProcessor& p)
-    : AudioProcessorEditor (&p), proc (p), curve (p), meter (p)
+    : AudioProcessorEditor (&p), proc (p), curve (p), meter (p), alignStatus (p)
 {
     setLookAndFeel (&look);
 
@@ -268,7 +334,25 @@ SumAlignEditor::SumAlignEditor (SumAlignProcessor& p)
     addAndMakeVisible (curve);
     addAndMakeVisible (meter);
 
-    setSize (760, 400);
+    alignButton.setTooltip ("Press, then play the song: SumAlign listens to this track and the reference on the sidechain, "
+                            "and sets Delay and Polarity when it's sure. Press again while listening to finish early.");
+    alignButton.onClick = [this] { proc.alignPressed(); };
+    alignButton.setColour (TextButton::textColourOffId, colours::accent);
+    addAndMakeVisible (alignButton);
+    earlierPoint.setTooltip ("Jump to the next point where this track also lines up with the reference, but earlier. "
+                             "Other points are e.g. a room mic's reflections: still phase-coherent, a different sense of space.");
+    laterPoint.setTooltip ("Jump to the next point where this track also lines up with the reference, but later "
+                           "(e.g. to keep some of a room mic's natural distance while staying in phase).");
+    earlierPoint.onClick = [this] { proc.stepPoint (-1); };
+    laterPoint.onClick   = [this] { proc.stepPoint (+1); };
+    addAndMakeVisible (earlierPoint);
+    addAndMakeVisible (laterPoint);
+    pointLabel.setJustificationType (Justification::centred);
+    pointLabel.setFont (FontOptions (11.0f));
+    addAndMakeVisible (pointLabel);
+    addAndMakeVisible (alignStatus);
+
+    setSize (760, 500);
     startTimerHz (30);
     timerCallback();
 }
@@ -310,6 +394,20 @@ void SumAlignEditor::timerCallback()
 
     curve.update();
     meter.update();
+    alignStatus.update();
+
+    const bool listening = proc.alignStatus().state == sa::AlignAnalyzer::State::listening;
+    alignButton.setButtonText (listening ? "FINISH" : "ALIGN");
+    alignButton.setToggleState (listening, dontSendNotification);
+    const auto pts = proc.alignPoints();
+    const int cur = proc.currentPointIndex();
+    earlierPoint.setEnabled (pts.size() > 1);
+    laterPoint.setEnabled (pts.size() > 1);
+    String pl = pts.empty() ? String ("no ALIGN yet")
+              : pts.size() == 1 ? String ("1 point")
+              : cur >= 0 ? "point " + String (cur + 1) + " of " + String ((int) pts.size())
+                         : String ((int) pts.size()) + " points (moved by hand)";
+    if (pointLabel.getText() != pl) pointLabel.setText (pl, dontSendNotification);
 }
 
 void SumAlignEditor::paint (Graphics& g)
@@ -325,7 +423,7 @@ void SumAlignEditor::paint (Graphics& g)
     g.drawText (String ("v") + JucePlugin_VersionString, getWidth() - 116, getHeight() - 22, 100, 16, Justification::centredRight);
     g.drawText ("Shift-drag = fine   |   double-click = reset   |   hover 3 s for help", 16, getHeight() - 22, 420, 16, Justification::centredLeft);
 
-    for (auto* a : { &delayArea, &phaseArea, &outArea })
+    for (auto* a : { &delayArea, &phaseArea, &outArea, &alignArea })
     {
         g.setColour (colours::panel);
         g.fillRoundedRectangle (a->toFloat(), 6.0f);
@@ -337,11 +435,14 @@ void SumAlignEditor::paint (Graphics& g)
     g.drawText ("TIME", delayArea.getX() + 12, delayArea.getY() + 8, 100, 14, Justification::centredLeft);
     g.drawText ("PHASE", phaseArea.getX() + 12, phaseArea.getY() + 8, 100, 14, Justification::centredLeft);
     g.drawText ("POLARITY", outArea.getX() + 12, outArea.getY() + 8, 100, 14, Justification::centredLeft);
+    g.drawText ("AUTO", alignArea.getX() + 12, alignArea.getY() + 8, 100, 14, Justification::centredLeft);
 }
 
 void SumAlignEditor::resized()
 {
     auto r = getLocalBounds().reduced (12).withTrimmedTop (36).withTrimmedBottom (18);
+    alignArea = r.removeFromBottom (92);
+    r.removeFromBottom (10);
     delayArea = r.removeFromLeft (250);
     r.removeFromLeft (10);
     outArea = r.removeFromRight (196);
@@ -371,6 +472,20 @@ void SumAlignEditor::resized()
         phaseCenter.slider.setBounds (right.withSizeKeepingCentre (130, 136));
         a.removeFromTop (8);
         curve.setBounds (a);
+    }
+    // AUTO: ALIGN
+    {
+        auto a = alignArea.reduced (12).withTrimmedTop (16);
+        alignButton.setBounds (a.removeFromLeft (150).withSizeKeepingCentre (150, 46));
+        a.removeFromLeft (16);
+        auto pts = a.removeFromRight (196);
+        auto row = pts.withSizeKeepingCentre (pts.getWidth(), 28).translated (0, -8);
+        earlierPoint.setBounds (row.removeFromLeft (row.getWidth() / 2 - 2));
+        row.removeFromLeft (4);
+        laterPoint.setBounds (row);
+        pointLabel.setBounds (pts.withTop (row.getBottom() + 2).withHeight (16));
+        a.removeFromRight (12);
+        alignStatus.setBounds (a.withSizeKeepingCentre (a.getWidth(), 56));
     }
     // POLARITY + meter
     {
