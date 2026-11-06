@@ -22,11 +22,11 @@ int main (int argc, char** argv)
     p.prepareToPlay (sr, 256);
 
     // kick-like hits into both mics; this one hears them lag samples later
-    const int n = (int) (sr * 12);
+    const int n = (int) (sr * 20);
     std::vector<float> src ((size_t) n + 4096, 0.0f);
     std::mt19937 rng (5);
     std::uniform_real_distribution<float> u (-1.0f, 1.0f);
-    for (int hit = 0; hit < 46; ++hit)
+    for (int hit = 0; hit < 78; ++hit)
     {
         const int at = 2048 + hit * (int) (sr * 0.25) + (int) (u (rng) * 800.0f);
         for (int i = 0; i < (int) (sr * 0.2) && at + i < (int) src.size(); ++i)
@@ -54,7 +54,7 @@ int main (int argc, char** argv)
             blk.setSample (2, i, ref); blk.setSample (3, i, ref);
         }
         p.processBlock (blk, midi);
-        if ((pos / 256) % 16 == 0) Thread::sleep (2);
+        if (p.alignStatus().state == sa::AlignAnalyzer::State::listening) Thread::sleep (1);   // ~5x real time while it listens
         p.checkAlign();
         if (sed != nullptr) sed->refresh();
     }

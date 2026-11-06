@@ -40,17 +40,32 @@ Every past version stays downloadable at https://github.com/Harencorey/sumalign/
 
 - It listens to this track's **raw input** (before SumAlign moves it) and the sidechain, on a background thread
   (the audio thread only copies samples into a lock-free buffer; it never waits or allocates).
-- It uses only the moments where both tracks have real, transient-rich signal (hits), cut into windows ~4x the
-  delay range long, and accumulates the cross-spectrum over all of them.
-- Coherence weighting: frequencies both mics really share count most; bleed, noise and one-mic-only content count
-  little. The correlation peak is then refined to a fraction of a sample by exact band-limited interpolation, and
-  its sign gives the polarity.
-- **Sure** = the fraction of single hits that agree on the same lag (within 1.5 samples), capped by how far the peak
-  stands out. It finishes by itself after at least 24 hits once it's 70 %+ sure and stable, when playback stops and
-  it already has a good answer, or after 2 minutes.
+- It finds the **reference's own hits** and takes one window per hit (starting 10 ms + the delay range before it).
+- **Correlation, half-whitened and A-weighted:** the cross-spectrum is divided by the 4th root of both power spectra
+  (so ringing drum tones don't swamp the timing), then weighted the way the ear hears loudness. The peak is refined to
+  a fraction of a sample by exact band-limited interpolation; its sign is the polarity.
+- **Sure** = the hits are dealt into 6 groups; it's how many groups, on their own, land on the same lag (within 2
+  samples) and polarity. It finishes by itself after 36+ hits once 5 of 6 agree and the answer is stable; when playback
+  stops with 4+ of 6 agreeing; or after 2 minutes. Below 4 of 6 it changes nothing.
 - Other strong peaks become the **Earlier / Later** points (saved with the session).
-- Tested on synthetic mic pairs with HF loss, a room reflection, bleed from another source and noise: worst error
-  0.87 microseconds (~0.3 mm) over 44.1-192 kHz, lags across the full +-30 ms, both polarities.
+
+**Chosen on real sessions** (Corey's drum session, the same kit and mics across songs, so a trustworthy measurement must
+give the same answer every song). Plain, +6 dB/oct, A-weighted, PHAT, SCOT and coherence-weighted correlation were all
+tried; only the half-whitened A-weighted one was consistent on every snare pair *and* physically sensible. Through the
+plug-in's own listening/stopping logic, Songs 1 / 3 / 4, against the snare top:
+
+| Track | Result (samples at 48 kHz) |
+|---|---|
+| Snare bottom | -21.8 / -21.1 / -22.2, inverted (0.45 ms) |
+| Snare top LDC | +1.7 / +1.0 / +1.6 |
+| Rack tom 1 | -37.2 / -36.8 / -36.5 |
+| Hi-hat | -87.9 / -88.3 / -86.6 |
+| OH L | -163.7 / -162.1 / -163.5 (3.4 ms) |
+| Room L | -765.7 / -765.7 / -765.6, inverted (16 ms) |
+| Kick port (vs kick in) | -52.1 / *not sure* / -52.7 |
+
+It needed 20-50 s of each song (intros included). On synthetic pairs with HF loss, a room reflection, bleed and noise:
+worst error 0.36 microseconds over 44.1-192 kHz across +-30 ms, both polarities.
 
 ## How it works
 
