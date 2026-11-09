@@ -87,6 +87,12 @@ if(SA_BUILD_TESTS)
     endif()
     add_test(NAME analysis COMMAND AnalysisTests)
 
+    # Whole-session ALIGN tests (network estimator, solver, hub): plain C++.
+    add_executable(NetworkTests tests/test_network.cpp)
+    target_include_directories(NetworkTests PRIVATE Source)
+    target_link_libraries(NetworkTests PRIVATE Threads::Threads)
+    add_test(NAME network COMMAND NetworkTests)
+
     # Plug-in level tests: the real processor, driven like a host drives it.
     juce_add_console_app(AlignProcessorTests PRODUCT_NAME "AlignProcessorTests")
     target_sources(AlignProcessorTests PRIVATE

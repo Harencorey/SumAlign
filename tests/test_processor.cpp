@@ -186,6 +186,97 @@ static void testAlign()
     CHECK (q.alignPoints().size() == p.alignPoints().size() && q.currentPointIndex() == 0, "points not restored");
 }
 
+// A host transport for the session test: playing, at a given timeline position
+struct FakePlayHead : AudioPlayHead
+{
+    int64 time = 0;
+    Optional<PositionInfo> getPosition() const override
+    {
+        PositionInfo p;
+        p.setIsPlaying (true);
+        p.setTimeInSamples (time);
+        return p;
+    }
+};
+
+static void testSession()
+{
+    std::printf ("Session ALIGN: 4 instances find each other, listen together on the timeline, each sets its own Delay/Polarity\n");
+    const double sr = 48000.0;
+    const int n = (int) (40 * sr);
+    // one drum-like source, heard by 4 "mics": delay (samples) and polarity per mic, plus one unrelated track
+    const double lag[4] = { 0.0, 37.4, 161.2, 766.0 };
+    const int pol[4] = { 1, -1, 1, -1 };
+    std::vector<float> src ((size_t) n + 4096, 0.0f), other ((size_t) n + 4096, 0.0f);
+    Random rng (5);
+    for (int at = 4000; at < n; at += (int) (sr * (0.2 + 0.3 * rng.nextFloat())))
+        for (int i = 0; i < (int) (0.3 * sr) && at + i < n; ++i)
+        {
+            const double t = i / sr;
+            src[(size_t) (at + i)] += (float) (0.5 * std::exp (-t / 0.1) * std::sin (2 * MathConstants<double>::pi * (150 + 100 * std::exp (-t / 0.01)) * t)
+                                               + 0.5 * std::exp (-t / 0.004) * (rng.nextFloat() * 2 - 1));
+        }
+    for (int i = 0; i < n; ++i) other[(size_t) i] = 0.2f * std::sin (0.031f * (float) i) * (std::sin (0.00002f * (float) i) > 0 ? 1.0f : 0.0f);
+
+    std::vector<std::unique_ptr<SumAlignProcessor>> procs;
+    FakePlayHead head;
+    for (int k = 0; k < 5; ++k)
+    {
+        auto p = std::make_unique<SumAlignProcessor>();
+        setLayout (*p, AudioChannelSet::mono(), AudioChannelSet::disabled());
+        p->setPlayHead (&head);
+        p->prepareToPlay (sr, 512);
+        procs.push_back (std::move (p));
+    }
+    CHECK (procs[0]->sessionMode(), "instances don't see each other");
+    procs[2]->setRef (false);
+    procs[0]->alignPressed();   // any instance starts it for all
+
+    std::vector<sa::Taps> taps (4);
+    for (int m = 0; m < 4; ++m) taps[(size_t) m].design (lag[m] + sa::kInterpHalf);
+    AudioBuffer<float> buf (1, 512);
+    MidiBuffer midi;
+    head.time = 1000000;
+    for (int pos = 4096; pos + 512 < n; pos += 512)
+    {
+        for (int k = 0; k < 5; ++k)
+        {
+            for (int i = 0; i < 512; ++i)
+            {
+                float v;
+                if (k < 4)
+                {
+                    double acc = 0;
+                    const auto& tp = taps[(size_t) k];
+                    for (int q = 0; q < sa::kTaps; ++q)
+                        acc += tp.h[(size_t) q] * src[(size_t) (pos + i - tp.whole - (q - sa::kInterpHalf) + sa::kInterpHalf)];
+                    v = (float) (pol[k] * acc);
+                }
+                else v = other[(size_t) (pos + i)];
+                buf.setSample (0, i, v);
+            }
+            procs[(size_t) k]->processBlock (buf, midi);
+        }
+        head.time += 512;
+        Thread::sleep (2);
+        if (procs[0]->hubStatus().state != sa::AlignHub::State::listening) break;
+    }
+    for (int i = 0; i < 300 && procs[0]->hubStatus().state == sa::AlignHub::State::listening; ++i) Thread::sleep (10);
+    for (auto& p : procs) p->checkAlign();
+    const auto hs = procs[0]->hubStatus();
+    CHECK (hs.state == sa::AlignHub::State::done, "session state %d", (int) hs.state);
+    for (int k = 0; k < 4; ++k)
+    {
+        const float want = (float) (-lag[k] * 1000.0 / sr);
+        const float got = procs[(size_t) k]->apvts.getRawParameterValue (sa::pid::delay)->load();
+        const bool inv = procs[(size_t) k]->apvts.getRawParameterValue (sa::pid::invert)->load() > 0.5f;
+        CHECK (std::abs (got - want) * sr / 1000.0 < 0.3 && inv == (pol[k] < 0), "mic %d: Delay %.4f ms (want %.4f), inverted %d", k, got, want, (int) inv);
+        std::printf ("  mic %d: Delay %+.4f ms (want %+.4f), %s\n", k, got, want, inv ? "inverted" : "normal");
+    }
+    CHECK (procs[4]->apvts.getRawParameterValue (sa::pid::delay)->load() == 0.0f, "unrelated track was moved");
+    std::printf ("  finished after %.1f s, %d group(s); the unrelated track was left alone\n", hs.heardSeconds, hs.groups);
+}
+
 static void testEditor()
 {
     std::printf ("Editor opens and closes\n");
@@ -204,6 +295,7 @@ int main()
     testReferenceMeter();
     testState();
     testAlign();
+    testSession();
     testEditor();
     if (failures == 0) std::printf ("\nALL PROCESSOR TESTS PASSED\n");
     else               std::printf ("\n%d FAILURE(S)\n", failures);

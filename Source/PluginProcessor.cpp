@@ -63,6 +63,9 @@ SumAlignProcessor::SumAlignProcessor()
     analyzer.prepare (48000.0, engine.maxShiftSamples());
     capX.assign (4096, 0.0f);
     capR.assign (4096, 0.0f);
+    hub = sa::AlignHub::get();
+    hubId = hub->join ("SumAlign");
+    appliedHubId = hub->getStatus().id;   // don't apply a result from before this instance existed
     startTimerHz (15);
 }
 
@@ -70,6 +73,20 @@ SumAlignProcessor::~SumAlignProcessor()
 {
     stopTimer();
     analyzer.shutdown();
+    if (hub != nullptr && hubId != 0) hub->leave (hubId);
+}
+
+void SumAlignProcessor::updateTrackProperties (const TrackProperties& p)
+{
+    // hosts call this off the audio thread; the hub takes a short lock
+    if (p.name.has_value() && hub != nullptr && hubId != 0)
+        hub->setName (hubId, p.name->toStdString());
+}
+
+void SumAlignProcessor::setRef (bool on)
+{
+    apvts.state.setProperty ("ref", on, nullptr);
+    if (hub != nullptr) hub->setRef (hubId, on);
 }
 
 bool SumAlignProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -137,7 +154,29 @@ void SumAlignProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
         }
     }
 
-    // ALIGN listens to the raw input (before this plug-in moves it) against the raw reference
+    // Session ALIGN: hand the raw input to the hub, tagged with the host's timeline position
+    if (hub != nullptr && hub->isListening() && numCh > 0)
+        if (auto* ph = getPlayHead())
+            if (auto pos = ph->getPosition())
+                if (pos->getIsPlaying())
+                    if (auto t = pos->getTimeInSamples())
+                    {
+                        const float* const* in = main.getArrayOfReadPointers();
+                        for (int p0 = 0; p0 < n;)
+                        {
+                            const int len = jmin (n - p0, (int) capX.size());
+                            for (int i = 0; i < len; ++i)
+                            {
+                                float x = 0.0f;
+                                for (int c = 0; c < numCh; ++c) x += in[c][p0 + i];
+                                capX[(size_t) i] = x;
+                            }
+                            hub->push (hubId, *t + p0, capX.data(), len, rate.load());
+                            p0 += len;
+                        }
+                    }
+
+    // Pair ALIGN listens to the raw input (before this plug-in moves it) against the raw reference
     if (analyzer.isListening() && scCh > 0 && numCh > 0)
     {
         const float* const* in = main.getArrayOfReadPointers();
@@ -186,6 +225,16 @@ void SumAlignProcessor::nudgeDelaySamples (double samples)
 //==============================================================================
 void SumAlignProcessor::alignPressed()
 {
+    if (sessionMode())
+    {
+        if (hub->isListening()) hub->finishNow();
+        else
+        {
+            analyzer.cancel();
+            hub->start (rate.load(), engine.maxShiftSamples());
+        }
+        return;
+    }
     const auto st = analyzer.getStatus();
     if (st.state == sa::AlignAnalyzer::State::listening) analyzer.finishNow();
     else analyzer.start();
@@ -193,6 +242,26 @@ void SumAlignProcessor::alignPressed()
 
 void SumAlignProcessor::timerCallback()
 {
+    // session result for this instance
+    if (hub != nullptr)
+    {
+        const auto hs = hub->getStatus();
+        for (auto& m : hs.members)   // keep the saved REF flag in step with the session (one REF at a time)
+            if (m.id == hubId && m.ref != isRef()) apvts.state.setProperty ("ref", m.ref, nullptr);
+        if (hs.id != appliedHubId)
+        {
+            appliedHubId = hs.id;
+            for (auto& m : hs.members)
+                if (m.id == hubId && m.result.group >= 0)
+                {
+                    const double ms = m.result.delaySamples * 1000.0 / rate.load();
+                    applyPoint ({ ms, m.result.polarity < 0, 1.0 });
+                    storePoints ({});   // pair-mode alternate points no longer apply
+                    apvts.state.setProperty ("alignConfidence", m.result.sure, nullptr);
+                }
+        }
+    }
+
     const auto st = analyzer.getStatus();
     if (st.id == appliedId) return;
     appliedId = st.id;
@@ -286,7 +355,10 @@ void SumAlignProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (apvts.state.getType()))
+        {
             apvts.replaceState (ValueTree::fromXml (*xml));
+            if (hub != nullptr) hub->setRef (hubId, isRef());
+        }
 }
 
 AudioProcessorEditor* SumAlignProcessor::createEditor() { return new SumAlignEditor (*this); }

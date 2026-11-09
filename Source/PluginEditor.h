@@ -63,6 +63,21 @@ private:
 };
 
 //==============================================================================
+// Session mode: every SumAlign track in the DAW, its group and what ALIGN set.
+class SessionList : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit SessionList (SumAlignProcessor& p) : proc (p) {}
+    void update();
+    void paint (juce::Graphics&) override;
+    int rowsHeight() const { return 22 + (int) st.members.size() * 18; }
+private:
+    SumAlignProcessor& proc;
+    sa::AlignHub::Status st;
+    juce::String sig;
+};
+
+//==============================================================================
 class SumAlignLook : public juce::LookAndFeel_V4
 {
 public:
@@ -113,6 +128,10 @@ private:
     juce::TextButton earlierPoint { juce::CharPointer_UTF8 ("\xe2\x97\x80  EARLIER") }, laterPoint { juce::CharPointer_UTF8 ("LATER  \xe2\x96\xb6") };
     juce::Label pointLabel;
     AlignStatusView alignStatus;
+    juce::TextButton refButton { "REF" };
+    SessionList sessionList;
+    juce::Viewport sessionView;
+    bool lastSession = false;
     juce::TooltipWindow tooltips { this, 3000 };
 
     juce::Rectangle<int> delayArea, phaseArea, outArea, alignArea;

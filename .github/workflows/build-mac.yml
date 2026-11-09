@@ -32,13 +32,16 @@ jobs:
         run: cmake -B build-mac -DCMAKE_BUILD_TYPE=Release -DSA_VERSION=${{ env.VERSION }}
 
       - name: Build
-        run: cmake --build build-mac --config Release --target SumAlign_AU SumAlign_VST3 SumAlign_Standalone AlignTests AnalysisTests AlignProcessorTests -j "$(sysctl -n hw.ncpu)"
+        run: cmake --build build-mac --config Release --target SumAlign_AU SumAlign_VST3 SumAlign_Standalone AlignTests AnalysisTests NetworkTests AlignProcessorTests -j "$(sysctl -n hw.ncpu)"
 
       - name: Engine tests (delay accuracy, null, phase, polarity, clicks, block-size independence, no audio-thread allocations)
         run: bash .github/run_test.sh ./build-mac/AlignTests
 
       - name: ALIGN analysis tests (fractional lags at 44.1-192k, polarity, HF loss/reflections/bleed, not-sure cases, alternate points, background thread)
         run: bash .github/run_test.sh ./build-mac/AnalysisTests
+
+      - name: Session ALIGN tests (synthetic kit, solver, the hub with 8 instances on a timeline)
+        run: bash .github/run_test.sh ./build-mac/NetworkTests
 
       - name: Plug-in tests (bus layouts, reference sidechain, reported latency, bypass, session save/load)
         run: bash .github/run_test.sh ./build-mac/AlignProcessorTests_artefacts/Release/AlignProcessorTests

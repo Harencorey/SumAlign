@@ -4,6 +4,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "AlignCore.h"
 #include "AlignAnalysis.h"
+#include "AlignHub.h"
 #include "Params.h"
 
 class SumAlignProcessor : public juce::AudioProcessor,
@@ -21,6 +22,8 @@ public:
     void processBlockBypassed (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
     using AudioProcessor::processBlock;
     using AudioProcessor::processBlockBypassed;
+
+    void updateTrackProperties (const TrackProperties&) override;
 
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
@@ -52,8 +55,14 @@ public:
     void nudgeDelaySamples (double samples);
 
     //--- ALIGN (message thread) -----------------------------------------------------------
-    // Press: start listening; press while listening: finish now with what's been heard.
+    // With 2+ SumAlign instances in the session: ALIGN listens to all of them together (session mode).
+    // Alone: ALIGN works against the sidechain (pair mode). Press while listening: finish now.
     void alignPressed();
+    bool sessionMode() const { return hub != nullptr && hub->numMembers() >= 2; }
+    sa::AlignHub::Status hubStatus() const { return hub != nullptr ? hub->getStatus() : sa::AlignHub::Status {}; }
+    int  hubMemberId() const noexcept { return hubId; }
+    bool isRef() const { return (bool) apvts.state.getProperty ("ref", false); }
+    void setRef (bool on);
     sa::AlignAnalyzer::Status alignStatus() const { return analyzer.getStatus(); }
     bool referenceConnected() const noexcept { return engine.refPresent.load(); }
 
@@ -71,6 +80,8 @@ private:
 
     sa::AlignAnalyzer analyzer;
     int appliedId = 0;
+    std::shared_ptr<sa::AlignHub> hub;   // shared by every SumAlign instance in this process
+    int hubId = 0, appliedHubId = 0;
     std::vector<float> capX, capR;            // mono mixes for the capture (sized in prepareToPlay)
 
     struct Raw { std::atomic<float>* delay {}, * invert {}, * phase {}, * phaseCenter {}; } raw;

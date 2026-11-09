@@ -192,7 +192,7 @@ void CorrelationMeter::paint (Graphics& g)
     if (! ref || ! live)
     {
         g.setColour (colours::dim);
-        g.drawFittedText (! ref ? "Route the reference track (e.g. the close mic) into SumAlign's sidechain to see how this track sums with it."
+        g.drawFittedText (! ref ? "Optional: route a reference track (e.g. the close mic) into the sidechain to see how this track sums with it."
                                 : "Waiting for signal on both this track and the sidechain.",
                           note.toNearestInt(), Justification::topLeft, 4);
     }
@@ -211,6 +211,41 @@ void CorrelationMeter::paint (Graphics& g)
 //==============================================================================
 void AlignStatusView::update()
 {
+    if (proc.sessionMode())
+    {
+        const auto hs = proc.hubStatus();
+        using H = sa::AlignHub::State;
+        listening = hs.state == H::listening;
+        progress = (float) hs.progress;
+        String a, b;
+        const double rate = proc.currentSampleRate();
+        const sa::AlignHub::MemberView* me = nullptr;
+        for (auto& m : hs.members) if (m.id == proc.hubMemberId()) me = &m;
+        if (hs.state == H::listening)
+        {
+            if (! hs.playing) { a = "Listening to all " + String ((int) hs.members.size()) + " SumAlign tracks... press play."; b = "Play the song (the whole song is best). Click FINISH to stop early."; }
+            else { a = "Listening... " + String (hs.heardSeconds, 0) + " s, " + String (hs.groups) + (hs.groups == 1 ? " group" : " groups") + " so far";
+                   b = "Keep playing; it finishes by itself once the answer stops changing. FINISH stops now."; }
+        }
+        else if (hs.state == H::done)
+        {
+            a = "Aligned the session: " + String (hs.groups) + (hs.groups == 1 ? " group." : " groups.");
+            if (me != nullptr && me->result.group >= 0)
+            {
+                const double ms = me->result.delaySamples * 1000.0 / rate;
+                b = "This track: Delay " + String (ms, 3) + " ms" + (me->result.polarity < 0 ? ", inverted" : "")
+                  + (me->result.anchor ? " (the anchor)" : "") + ", " + String (roundToInt (me->result.sure * 100.0)) + " % sure.";
+            }
+            else b = "This track was left alone: it doesn't share enough of the same sound with the others (or its links disagree).";
+        }
+        else
+        {
+            a = String ((int) hs.members.size()) + " SumAlign tracks in this session.";
+            b = "Press ALIGN on any of them and play the song: they all listen together. Mark one REF to anchor to it.";
+        }
+        if (a != line1 || b != line2 || listening) { line1 = a; line2 = b; repaint(); }
+        return;
+    }
     st = proc.alignStatus();
     ref = proc.referenceConnected();
     using S = sa::AlignAnalyzer::State;
@@ -275,8 +310,61 @@ void AlignStatusView::paint (Graphics& g)
 }
 
 //==============================================================================
+void SessionList::update()
+{
+    st = proc.hubStatus();
+    String s2 = String ((int) st.state) + "|" + String (st.id) + "|" + String (proc.hubMemberId());
+    for (auto& m : st.members)
+        s2 << "|" << m.id << m.name << (int) m.ref << m.result.group << String (m.result.delaySamples, 2) << m.result.polarity << (int) m.live;
+    if (s2 != sig) { sig = s2; setSize (getWidth(), rowsHeight()); repaint(); }
+}
+
+void SessionList::paint (Graphics& g)
+{
+    const double rate = proc.currentSampleRate();
+    const int w = getWidth();
+    const int cName = 10, cGroup = w - 360, cDelay = w - 290, cPol = w - 160, cSure = w - 90;
+    g.setFont (FontOptions (10.5f, Font::bold));
+    g.setColour (colours::dim);
+    g.drawText ("TRACK", cName, 2, 200, 16, Justification::centredLeft);
+    g.drawText ("GROUP", cGroup, 2, 60, 16, Justification::centredLeft);
+    g.drawText ("DELAY", cDelay, 2, 120, 16, Justification::centredLeft);
+    g.drawText ("POLARITY", cPol, 2, 70, 16, Justification::centredLeft);
+    g.drawText ("SURE", cSure, 2, 80, 16, Justification::centredLeft);
+    const bool hasResult = st.state == sa::AlignHub::State::done || st.state == sa::AlignHub::State::listening;
+    int y = 22;
+    for (auto& m : st.members)
+    {
+        const bool me = m.id == proc.hubMemberId();
+        if (me) { g.setColour (colours::accent.withAlpha (0.12f)); g.fillRect (0, y - 1, w, 18); }
+        g.setFont (FontOptions (12.0f, me ? Font::bold : Font::plain));
+        g.setColour (me ? colours::text : colours::text.withAlpha (0.85f));
+        String name = m.name.empty() ? "Track " + String (m.id) : String (m.name);
+        if (m.ref) name << "  [REF]";
+        g.drawText (name, cName, y, cGroup - cName - 8, 16, Justification::centredLeft);
+        g.setColour (colours::dim);
+        if (hasResult && st.id > 0 && m.result.group >= 0)
+        {
+            const double ms = m.result.delaySamples * 1000.0 / rate;
+            g.setColour (colours::text);
+            g.drawText (String::charToString ((juce_wchar) ('A' + m.result.group)), cGroup, y, 60, 16, Justification::centredLeft);
+            const String msText = std::abs (ms) < 0.0005 ? String ("0.000") : (ms > 0 ? "+" : "") + String (ms, 3);
+            g.drawText (msText + " ms" + (m.result.anchor ? "  (anchor)" : ""), cDelay, y, 130, 16, Justification::centredLeft);
+            g.drawText (m.result.polarity < 0 ? "inverted" : "normal", cPol, y, 70, 16, Justification::centredLeft);
+            g.setColour (m.result.sure >= 0.7 ? colours::good : colours::accent);
+            g.drawText (String (roundToInt (m.result.sure * 100.0)) + " %", cSure, y, 80, 16, Justification::centredLeft);
+        }
+        else if (hasResult && st.id > 0)
+            g.drawText (String (CharPointer_UTF8 ("left alone \xe2\x80\x94 nothing shared")), cGroup, y, w - cGroup, 16, Justification::centredLeft);
+        else
+            g.drawText (st.state == sa::AlignHub::State::listening ? (m.live ? "listening..." : "no audio yet") : "", cGroup, y, w - cGroup, 16, Justification::centredLeft);
+        y += 18;
+    }
+}
+
+//==============================================================================
 SumAlignEditor::SumAlignEditor (SumAlignProcessor& p)
-    : AudioProcessorEditor (&p), proc (p), curve (p), meter (p), alignStatus (p)
+    : AudioProcessorEditor (&p), proc (p), curve (p), meter (p), alignStatus (p), sessionList (p)
 {
     setLookAndFeel (&look);
 
@@ -352,7 +440,18 @@ SumAlignEditor::SumAlignEditor (SumAlignProcessor& p)
     addAndMakeVisible (pointLabel);
     addAndMakeVisible (alignStatus);
 
-    setSize (760, 500);
+    refButton.setClickingTogglesState (true);
+    refButton.setTooltip ("Anchor the session to this track: it stays put and the others line up to it. "
+                          "Without a REF, the earliest track in each group stays at 0 and the rest move earlier.");
+    refButton.onClick = [this] { proc.setRef (refButton.getToggleState()); };
+    addChildComponent (refButton);
+    sessionList.setTooltip ("Every SumAlign track in this session. Tracks in the same group were lined up together; "
+                            "'left alone' tracks don't share enough sound with the others and keep their settings.");
+    sessionView.setViewedComponent (&sessionList, false);
+    sessionView.setScrollBarsShown (true, false);
+    addChildComponent (sessionView);
+
+    setSize (760, 640);
     startTimerHz (30);
     timerCallback();
 }
@@ -396,7 +495,21 @@ void SumAlignEditor::timerCallback()
     meter.update();
     alignStatus.update();
 
-    const bool listening = proc.alignStatus().state == sa::AlignAnalyzer::State::listening;
+    const bool session = proc.sessionMode();
+    if (session != lastSession) { lastSession = session; resized(); repaint(); }
+    refButton.setVisible (session);
+    sessionView.setVisible (session);
+    earlierPoint.setVisible (! session); laterPoint.setVisible (! session); pointLabel.setVisible (! session);
+    if (session)
+    {
+        sessionList.update();
+        bool hubRef = false;
+        for (auto& m : proc.hubStatus().members) if (m.id == proc.hubMemberId()) hubRef = m.ref;
+        refButton.setToggleState (hubRef, dontSendNotification);
+    }
+
+    const bool listening = session ? proc.hubStatus().state == sa::AlignHub::State::listening
+                                   : proc.alignStatus().state == sa::AlignAnalyzer::State::listening;
     alignButton.setButtonText (listening ? "FINISH" : "ALIGN");
     alignButton.setToggleState (listening, dontSendNotification);
     const auto pts = proc.alignPoints();
@@ -435,13 +548,13 @@ void SumAlignEditor::paint (Graphics& g)
     g.drawText ("TIME", delayArea.getX() + 12, delayArea.getY() + 8, 100, 14, Justification::centredLeft);
     g.drawText ("PHASE", phaseArea.getX() + 12, phaseArea.getY() + 8, 100, 14, Justification::centredLeft);
     g.drawText ("POLARITY", outArea.getX() + 12, outArea.getY() + 8, 100, 14, Justification::centredLeft);
-    g.drawText ("AUTO", alignArea.getX() + 12, alignArea.getY() + 8, 100, 14, Justification::centredLeft);
+    g.drawText (proc.sessionMode() ? "AUTO  -  SESSION" : "AUTO  -  SIDECHAIN", alignArea.getX() + 12, alignArea.getY() + 8, 200, 14, Justification::centredLeft);
 }
 
 void SumAlignEditor::resized()
 {
     auto r = getLocalBounds().reduced (12).withTrimmedTop (36).withTrimmedBottom (18);
-    alignArea = r.removeFromBottom (92);
+    alignArea = r.removeFromBottom (232);
     r.removeFromBottom (10);
     delayArea = r.removeFromLeft (250);
     r.removeFromLeft (10);
@@ -476,16 +589,21 @@ void SumAlignEditor::resized()
     // AUTO: ALIGN
     {
         auto a = alignArea.reduced (12).withTrimmedTop (16);
-        alignButton.setBounds (a.removeFromLeft (150).withSizeKeepingCentre (150, 46));
-        a.removeFromLeft (16);
-        auto pts = a.removeFromRight (196);
+        auto top = a.removeFromTop (60);
+        alignButton.setBounds (top.removeFromLeft (150).withSizeKeepingCentre (150, 46));
+        top.removeFromLeft (16);
+        auto pts = top.removeFromRight (196);
         auto row = pts.withSizeKeepingCentre (pts.getWidth(), 28).translated (0, -8);
         earlierPoint.setBounds (row.removeFromLeft (row.getWidth() / 2 - 2));
         row.removeFromLeft (4);
         laterPoint.setBounds (row);
         pointLabel.setBounds (pts.withTop (row.getBottom() + 2).withHeight (16));
-        a.removeFromRight (12);
-        alignStatus.setBounds (a.withSizeKeepingCentre (a.getWidth(), 56));
+        refButton.setBounds (pts.withSizeKeepingCentre (90, 30).withX (pts.getRight() - 90));
+        top.removeFromRight (12);
+        alignStatus.setBounds (top.withSizeKeepingCentre (top.getWidth(), 56));
+        a.removeFromTop (6);
+        sessionView.setBounds (a);
+        sessionList.setSize (a.getWidth() - 10, sessionList.rowsHeight());
     }
     // POLARITY + meter
     {

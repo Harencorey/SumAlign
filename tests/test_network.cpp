@@ -7,6 +7,8 @@
 //==============================================================================
 
 #include "AlignNetwork.h"
+#include "AlignHub.h"
+#include <thread>
 #include "AlignCore.h"
 
 #include <cmath>
@@ -225,11 +227,61 @@ static void testSolverRobust()
     CHECK (r[1].clamped && std::abs (r[1].delaySamples + 1440) < 1e-9, "clamp: %.1f", r[1].delaySamples);
 }
 
+static void testHub()
+{
+    std::printf ("Hub: 8 instances push their tracks on the DAW timeline (with a loop jump); the hub lines them up and solves\n");
+    const double sr = 48000.0;
+    auto kit = makeKit (sr, 40.0, 21);
+    auto hub = sa::AlignHub::get();
+    std::vector<int> ids;
+    for (auto& n : kit.names) ids.push_back (hub->join (n));
+    CHECK (hub->numMembers() == 8, "members %d", hub->numMembers());
+    const int maxLag = (int) std::lround (sa::kMaxShiftMs * 0.001 * sr);
+    hub->start (sr, maxLag);
+    const int block = 512;
+    const size_t n = kit.tracks[0].size();
+    long long timeline = 960000;   // the song starts 20 s into the timeline
+    size_t pos = 0;
+    bool jumped = false;
+    while (pos + block <= n && hub->isListening())
+    {
+        // each "instance" pushes its own block (order varies, as threads would)
+        for (size_t k = 0; k < ids.size(); ++k)
+        {
+            const size_t m = (k * 3 + pos / block) % ids.size();
+            hub->push (ids[m], timeline, kit.tracks[m].data() + pos, block, sr);
+        }
+        pos += block; timeline += block;
+        if (! jumped && pos > n / 2) { pos -= (size_t) (8 * sr); timeline -= (long long) (8 * sr); jumped = true; }   // loop back 8 s
+        std::this_thread::sleep_for (std::chrono::microseconds (3500));   // ~3x real time
+    }
+    for (int i = 0; i < 400 && hub->isListening(); ++i) std::this_thread::sleep_for (std::chrono::milliseconds (10));
+    const bool finishedItself = ! hub->isListening();
+    if (hub->isListening()) { hub->finishNow(); std::this_thread::sleep_for (std::chrono::milliseconds (500)); }
+    const auto st = hub->getStatus();
+    CHECK (st.state == sa::AlignHub::State::done, "hub state %d", (int) st.state);
+    for (size_t m = 0; m < st.members.size(); ++m)
+    {
+        const auto& r = st.members[m].result;
+        if (m < 7)
+        {
+            const double want = -(kit.delay[m] - kit.delay[0]);
+            CHECK (r.group == 0 && std::abs (r.delaySamples - want) < 0.6 && r.polarity == kit.pol[m],
+                   "%s: group %d delay %.2f (want %.2f) pol %d", kit.names[m].c_str(), r.group, r.delaySamples, want, r.polarity);
+        }
+        else CHECK (r.group == -1, "vocal grouped");
+    }
+    std::printf ("  finished after %.1f s of audio, %d group(s)%s\n", st.heardSeconds, st.groups, finishedItself ? " (by itself)" : " (FINISH)");
+    for (int id : ids) hub->leave (id);
+    CHECK (hub->numMembers() == 0, "members left %d", hub->numMembers());
+}
+
 int main()
 {
     testKit();
     testRef();
     testSolverRobust();
+    testHub();
     if (gFailures == 0) std::printf ("\nALL NETWORK TESTS PASSED\n");
     else                std::printf ("\n%d FAILURE(S)\n", gFailures);
     return gFailures == 0 ? 0 : 1;
