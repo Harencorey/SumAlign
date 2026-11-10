@@ -26,6 +26,18 @@ Every past version stays downloadable at https://github.com/Harencorey/sumalign/
    share enough sound with the others are **left alone** (keep their settings).
 4. Optional: mark one track **REF** to anchor to it (it stays at 0, the rest line up to it). Without a REF, the
    earliest track in each group stays at 0 and the rest move earlier.
+5. **Not on buses.** A bus is the sum of tracks SumAlign already hears, so it would be measured against its own
+   sources (and could even become the anchor). Leave buses, aux returns and effect tracks without SumAlign, or set
+   their GROUP to **Off**. Names like "Drum Bus", "Kick Aux", "Verb", "Smash", "Stem" sit out automatically.
+6. **GROUP** (next to REF): **Auto** groups by the sound tracks share, helped by the track names; **A-H** puts the
+   track in that group yourself (it's only aligned with tracks set to the same letter, and a weaker but agreeing
+   measurement is accepted); **Off** sits out.
+
+**Track names.** In Auto, names are read for the instrument: drums (kick, snare, snr, sn, tom, rt, ft, fl, hat, hh,
+ride, OH, room...), bass, guitar (gtr, guitar...), vocals (vox, bgv...), keys. Tracks named as two different
+instruments are never grouped, so the kick bleeding into the bass amp mic can't pull the bass into the drums, while
+"Bass DI" and "Bass Amp" group with each other. Unrecognised names ("414", "Audio 3") can group with anything.
+"Bass Drum" counts as drums; "Gtr Room" as guitar.
 
 ## Using it: one pair through the sidechain (a single instance)
 

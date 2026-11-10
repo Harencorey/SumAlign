@@ -63,6 +63,9 @@ public:
     int  hubMemberId() const noexcept { return hubId; }
     bool isRef() const { return (bool) apvts.state.getProperty ("ref", false); }
     void setRef (bool on);
+    // session group: -1 = Auto (by sound + track name), -2 = Off (sits out: buses, effects), 0..7 = A..H
+    int  groupSetting() const { return (int) apvts.state.getProperty ("group", -1); }
+    void setGroupSetting (int g);
     sa::AlignAnalyzer::Status alignStatus() const { return analyzer.getStatus(); }
     bool referenceConnected() const noexcept { return engine.refPresent.load(); }
 

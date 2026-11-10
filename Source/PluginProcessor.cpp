@@ -83,6 +83,13 @@ void SumAlignProcessor::updateTrackProperties (const TrackProperties& p)
         hub->setName (hubId, p.name->toStdString());
 }
 
+void SumAlignProcessor::setGroupSetting (int g)
+{
+    g = jlimit (-2, 7, g);
+    apvts.state.setProperty ("group", g, nullptr);
+    if (hub != nullptr) hub->setGroup (hubId, g);
+}
+
 void SumAlignProcessor::setRef (bool on)
 {
     apvts.state.setProperty ("ref", on, nullptr);
@@ -357,7 +364,7 @@ void SumAlignProcessor::setStateInformation (const void* data, int sizeInBytes)
         if (xml->hasTagName (apvts.state.getType()))
         {
             apvts.replaceState (ValueTree::fromXml (*xml));
-            if (hub != nullptr) hub->setRef (hubId, isRef());
+            if (hub != nullptr) { hub->setRef (hubId, isRef()); hub->setGroup (hubId, groupSetting()); }
         }
 }
 

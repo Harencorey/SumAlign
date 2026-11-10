@@ -113,6 +113,7 @@ static void testState()
     setParam (a, sa::pid::invert, 1.0f);
     setParam (a, sa::pid::phase, 72.5f);
     setParam (a, sa::pid::phaseCenter, 1800.0f);
+    a.setGroupSetting (3);   // group D
     MemoryBlock mb;
     a.getStateInformation (mb);
     SumAlignProcessor b;
@@ -120,6 +121,10 @@ static void testState()
     for (auto* id : { sa::pid::delay, sa::pid::invert, sa::pid::phase, sa::pid::phaseCenter })
         CHECK (std::abs (a.apvts.getRawParameterValue (id)->load() - b.apvts.getRawParameterValue (id)->load()) < 1e-6f,
                "%s not restored", id);
+    CHECK (b.groupSetting() == 3, "group setting not restored (%d)", b.groupSetting());
+    bool hubHasIt = false;
+    for (auto& m : b.hubStatus().members) if (m.id == b.hubMemberId()) hubHasIt = m.group == 3;
+    CHECK (hubHasIt, "hub doesn't know the restored group");
     // text entry round-trips
     auto* d = b.apvts.getParameter (sa::pid::delay);
     CHECK (std::abs (d->getValueForText ("-0.35 ms") - d->convertTo0to1 (-0.35f)) < 1e-6f, "typing -0.35 ms");

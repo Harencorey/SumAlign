@@ -20,12 +20,13 @@ struct Head : AudioPlayHead
 static int sessionSnapshot (const File& out)
 {
     const double sr = 48000;
-    const char* names[6] = { "Kick In", "Snare Top", "Snare Bot", "OH L", "Room L", "Vocal" };
-    const double lag[6] = { 0.0, 4.8, 26.0, 166.0, 771.0, 0.0 };
-    const int pol[6] = { 1, 1, -1, 1, -1, 1 };
+    constexpr int K = 7;
+    const char* names[K] = { "Kick In", "Snare Top", "Snare Bot", "OH L", "Room L", "Vocal", "Drum Bus" };
+    const double lag[K] = { 0.0, 4.8, 26.0, 166.0, 771.0, 0.0, 0.0 };
+    const int pol[K] = { 1, 1, -1, 1, -1, 1, 1 };
     std::vector<std::unique_ptr<SumAlignProcessor>> ps;
     Head head;
-    for (int k = 0; k < 6; ++k)
+    for (int k = 0; k < K; ++k)
     {
         auto p = std::make_unique<SumAlignProcessor>();
         AudioProcessor::TrackProperties tp; tp.name = String (names[k]);
@@ -49,10 +50,10 @@ static int sessionSnapshot (const File& out)
     AudioBuffer<float> b (4, 256);
     MidiBuffer midi;
     head.time = 480000;
-    const double gk[6] = { 1.0, 0.25, 0.3, 0.4, 0.5, 0.0 }, gs[6] = { 0.1, 1.0, 0.8, 0.6, 0.5, 0.0 };
+    const double gk[K] = { 1.0, 0.25, 0.3, 0.4, 0.5, 0.0, 1.0 }, gs[K] = { 0.1, 1.0, 0.8, 0.6, 0.5, 0.0, 1.0 };
     for (int pos = 4096; pos + 256 < n; pos += 256)
     {
-        for (int k = 0; k < 6; ++k)
+        for (int k = 0; k < K; ++k)
         {
             for (int i = 0; i < 256; ++i)
             {

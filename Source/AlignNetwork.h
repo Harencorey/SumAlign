@@ -14,6 +14,7 @@
 //==============================================================================
 
 #include "AlignAnalysis.h"
+#include "AlignNames.h"
 #include <functional>
 #include <numeric>
 
@@ -30,9 +31,14 @@ struct PairEdge
     double prominence = 1.0;    // main peak / strongest other peak (> 1; higher = less ambiguous)
 };
 
+// why a track was left alone
+enum class LeftAlone { no = 0, nothingShared, disagree, notWithGroup, off, noAudio };
+
 struct TrackAlign
 {
-    int group = -1;             // -1 = ungrouped (shares nothing confident with anyone): left alone
+    int group = -1;             // -1 = ungrouped: left alone (see why)
+    int letter = -1;            // the group's letter shown to the user (0 = A); a manual group keeps its own
+    LeftAlone why = LeftAlone::nothingShared;
     double delaySamples = 0.0;  // what to set Delay to
     int polarity = 1;           // what to set Polarity to (+1 normal, -1 inverted), relative to the anchor
     double sure = 0.0;          // weakest link between this track and the anchor
@@ -396,6 +402,30 @@ private:
 //     earlier, like Phase 2). With a REF, that track stays at 0.
 // Measured on Corey's drum session (Songs 1/3/4): the same answer song after song for overheads, rooms,
 // toms, snare bottom (0.45 ms, inverted), LDC and ride; the ambiguous tracks were the low-support ones.
+// What the user and the track names say (both optional; empty = all Auto, names unknown).
+//   group[i]:  -1 = Auto, -2 = Off (sits out: buses, effects), 0..7 = a manual group (A..H)
+//   family[i]: from the track name (AlignNames.h)
+// Manual groups are closed: a track in group A only links with other A tracks (and vice versa), and
+// inside a manual group the bar is lower (sure >= 0.5, support >= 25 %): the user has said these belong
+// together, so a weaker but agreeing measurement is used instead of leaving the track alone.
+// Auto tracks link only with Auto tracks, never across two different known families.
+struct SessionHints
+{
+    std::vector<int> group;
+    std::vector<Family> family;
+    int groupOf (int i) const     { return i >= 0 && i < (int) group.size() ? group[(size_t) i] : -1; }
+    Family familyOf (int i) const { return i >= 0 && i < (int) family.size() ? family[(size_t) i] : Family::unknown; }
+    bool off (int i) const        { return groupOf (i) == -2; }
+    bool manual (int i) const     { return groupOf (i) >= 0; }
+    bool mayLink (int a, int b) const
+    {
+        if (off (a) || off (b)) return false;
+        const int ga = groupOf (a), gb = groupOf (b);
+        if (ga >= 0 || gb >= 0) return ga == gb;
+        return familiesMayLink (familyOf (a), familyOf (b));
+    }
+};
+
 inline double edgeWeight (const PairEdge& e)
 {
     const double prom = std::clamp ((e.prominence - 1.0) / 0.3, 0.15, 1.0);
@@ -404,11 +434,19 @@ inline double edgeWeight (const PairEdge& e)
 
 // directed: e.a = whose hits were used, e.b relative to e.a (lag = t_b - t_a)
 inline std::vector<TrackAlign> solveSession (int N, const std::vector<PairEdge>& directed, int refTrack, double maxShiftSamples,
-                                             double minSure = 0.66, double tol = 3.0, double minSupport = 0.4)
+                                             const SessionHints& hints = {})
 {
+    constexpr double minSure = 0.66, minSureManual = 0.5, tol = 3.0, minSupportAuto = 0.4, minSupportManual = 0.25;
     std::vector<TrackAlign> res ((size_t) N);
+    for (int i = 0; i < N; ++i) if (hints.off (i)) res[(size_t) i].why = LeftAlone::off;
+    if (refTrack >= 0 && (refTrack >= N || hints.off (refTrack))) refTrack = -1;
     std::vector<const PairEdge*> E;
-    for (auto& e : directed) if (e.sure >= minSure && e.a != e.b && e.a >= 0 && e.b >= 0 && e.a < N && e.b < N) E.push_back (&e);
+    for (auto& e : directed)
+    {
+        if (e.a == e.b || e.a < 0 || e.b < 0 || e.a >= N || e.b >= N || ! hints.mayLink (e.a, e.b)) continue;
+        const bool inManual = hints.manual (e.a);   // mayLink: both in the same manual group
+        if (e.sure >= (inManual ? minSureManual : minSure)) E.push_back (&e);
+    }
 
     // connected components on confident pairs
     std::vector<int> comp ((size_t) N, -1);
@@ -429,12 +467,28 @@ inline std::vector<TrackAlign> solveSession (int N, const std::vector<PairEdge>&
         ++nComp;
     }
 
+    // a manual group that falls apart into pieces: keep the piece with the REF, else the biggest
+    for (int g = 0; g < 8; ++g)
+    {
+        std::vector<int> size ((size_t) nComp, 0);
+        int keep = -1;
+        for (int v = 0; v < N; ++v) if (hints.groupOf (v) == g) ++size[(size_t) comp[(size_t) v]];
+        for (int c = 0; c < nComp; ++c) if (size[(size_t) c] > 0 && (keep < 0 || size[(size_t) c] > size[(size_t) keep])) keep = c;
+        if (refTrack >= 0 && hints.groupOf (refTrack) == g) keep = comp[(size_t) refTrack];
+        for (int v = 0; v < N; ++v)
+            if (hints.groupOf (v) == g && comp[(size_t) v] != keep) { res[(size_t) v].why = LeftAlone::notWithGroup; comp[(size_t) v] = -1; }
+    }
+
+    unsigned usedLetters = 0;
+    for (int v = 0; v < N; ++v) if (hints.manual (v)) usedLetters |= 1u << hints.groupOf (v);
+
     int groupId = 0;
     for (int c = 0; c < nComp; ++c)
     {
         std::vector<int> members;
         for (int v = 0; v < N; ++v) if (comp[(size_t) v] == c) members.push_back (v);
         if (members.size() < 2) continue;
+        auto minSupportOf = [&] (int v) { return hints.manual (v) ? minSupportManual : minSupportAuto; };
 
         int root = -1;
         if (refTrack >= 0 && comp[(size_t) refTrack] == c) root = refTrack;
@@ -504,7 +558,7 @@ inline std::vector<TrackAlign> solveSession (int N, const std::vector<PairEdge>&
                 order.push_back (bestJ);
             }
             // judge every placed track against ALL other placed tracks; set aside the least supported one
-            int worst = -1; double worstFrac = minSupport;
+            int worst = -1; double worstMargin = 0.0;
             for (int j : order)
             {
                 if (j == root) continue;
@@ -517,12 +571,19 @@ inline std::vector<TrackAlign> solveSession (int N, const std::vector<PairEdge>&
                 const bool same = p == pol[(size_t) j] && std::abs (pos - t[(size_t) j]) <= tol;
                 const double frac = same ? sw / tot : 0.0;
                 sure[(size_t) j] = same ? ms * frac : 0.0;
-                if (frac < worstFrac) { worstFrac = frac; worst = j; }
+                const double margin = frac - minSupportOf (j);   // below 0 = not supported enough
+                if (margin < worstMargin) { worstMargin = margin; worst = j; }
             }
             if (worst < 0) break;
             excluded[(size_t) worst] = 1;
         }
+        for (int v : members) res[(size_t) v].why = LeftAlone::disagree;   // until placed below
         if (order.size() < 2) continue;
+
+        int letter = -1;
+        for (int v : order) if (hints.manual (v)) letter = hints.groupOf (v);
+        if (letter < 0) { letter = 0; while (letter < 25 && (usedLetters & (1u << letter))) ++letter; }
+        usedLetters |= 1u << letter;
 
         // anchor: REF, or the earliest placed track
         int anchor = root;
@@ -532,6 +593,8 @@ inline std::vector<TrackAlign> solveSession (int N, const std::vector<PairEdge>&
         {
             auto& r = res[(size_t) v];
             r.group = groupId;
+            r.letter = letter;
+            r.why = LeftAlone::no;
             double d = -(t[(size_t) v] - t[(size_t) anchor]);
             if (std::abs (d) > maxShiftSamples) { r.clamped = true; d = std::clamp (d, -maxShiftSamples, maxShiftSamples); }
             r.delaySamples = d;

@@ -67,6 +67,8 @@ private:
 class SessionList : public juce::Component, public juce::SettableTooltipClient
 {
 public:
+    // why a track sits out, in words (empty when it was aligned)
+    static juce::String leftAloneText (const sa::AlignHub::MemberView&);
     explicit SessionList (SumAlignProcessor& p) : proc (p) {}
     void update();
     void paint (juce::Graphics&) override;
@@ -129,6 +131,7 @@ private:
     juce::Label pointLabel;
     AlignStatusView alignStatus;
     juce::TextButton refButton { "REF" };
+    juce::ComboBox groupBox;   // Auto / A..H / Off
     SessionList sessionList;
     juce::Viewport sessionView;
     bool lastSession = false;

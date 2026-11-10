@@ -33,6 +33,10 @@ public:
         int id = 0;
         std::string name;
         bool ref = false;
+        int group = -1;           // the user's setting: -1 Auto, -2 Off, 0..7 = A..H
+        Family family = Family::unknown;   // from the name
+        bool nameSaysBus = false; // the name looks like a bus/effect: an Auto instance sits out
+        bool off() const { return group == -2 || (group == -1 && nameSaysBus); }
         bool live = false;        // has sent audio during this ALIGN
         int hits = 0;
         TrackAlign result;        // valid when the hub's state is done (or as a preview while listening)
@@ -86,6 +90,7 @@ public:
             m.ring.clear();
             m.id = nextId++;
             m.name = name;
+            m.group = -1;
             m.local.clear(); m.hasData = false;
             m.used.store (true, std::memory_order_release);
             return m.id;
@@ -102,6 +107,8 @@ public:
     }
 
     void setName (int id, const std::string& name)  { std::lock_guard<std::mutex> lk (mtx); if (auto* m = find (id)) m->name = name; }
+    // -1 = Auto, -2 = Off, 0..7 = manual group A..H
+    void setGroup (int id, int g)                   { std::lock_guard<std::mutex> lk (mtx); if (auto* m = find (id)) m->group = std::clamp (g, -2, 7); }
     void setRef (int id, bool on)                   { std::lock_guard<std::mutex> lk (mtx); refId = on ? id : (refId == id ? -1 : refId); }
     int  numMembers() const                         { std::lock_guard<std::mutex> lk (mtx); int c = 0; for (auto& m : pool) c += m.used.load() ? 1 : 0; return c; }
 
@@ -161,7 +168,9 @@ public:
             if (! mm.used.load()) continue;
             const Member* m = &mm;
             MemberView v;
-            v.id = m->id; v.name = m->name; v.ref = refId == m->id;
+            v.id = m->id; v.name = m->name; v.ref = refId == m->id; v.group = m->group;
+            const auto ni = classifyTrackName (m->name);
+            v.family = ni.family; v.nameSaysBus = ni.bus;
             for (size_t k = 0; k < slots.size(); ++k)
                 if (slots[k] == m->id)
                 {
@@ -169,6 +178,7 @@ public:
                     v.hits = k < (size_t) est.numTracks() ? est.hitsOf ((int) k) : 0;
                     if (k < results.size()) v.result = results[k];
                 }
+            if (v.off() && v.result.group < 0) v.result.why = LeftAlone::off;
             s.members.push_back (v);
         }
         return s;
@@ -225,6 +235,7 @@ private:
         bool allocated = false;
         int id = 0;
         std::string name;
+        int group = -1;
         TimedRing ring;
         std::vector<float> local;     // contiguous audio starting at localStart (timeline samples)
         long long localStart = 0;
@@ -253,6 +264,17 @@ private:
         const int refSnap = refId;
         std::vector<Member*> live;
         for (auto& m : pool) if (m.used.load()) live.push_back (&m);
+        SessionHints hints;
+        hints.group.assign (slots.size(), -2);        // a slot whose instance has gone: off
+        hints.family.assign (slots.size(), Family::unknown);
+        for (size_t k = 0; k < slots.size(); ++k)
+            for (auto* m : live)
+                if (m->id == slots[k])
+                {
+                    const auto ni = classifyTrackName (m->name);
+                    hints.group[k] = (m->group == -1 && ni.bus) ? -2 : m->group;
+                    hints.family[k] = ni.family;
+                }
         lk.unlock();
 
         // 1) drain each member's ring into its contiguous local buffer
@@ -285,9 +307,10 @@ private:
         std::vector<Member*> bySlot (slots.size(), nullptr);
         for (size_t k = 0; k < slots.size(); ++k)
             for (auto* m : live) if (m->id == slots[k]) bySlot[k] = m;
-        for (auto* m : bySlot)
+        for (size_t k = 0; k < bySlot.size(); ++k)
         {
-            if (m == nullptr || ! m->hasData || m->lastSeen < newest - (long long) (1.5 * sr)) continue;   // not live
+            auto* m = bySlot[k];
+            if (m == nullptr || hints.off ((int) k) || ! m->hasData || m->lastSeen < newest - (long long) (1.5 * sr)) continue;   // not live / sitting out
             from = std::max (from, m->localStart);
             to = std::min (to, m->localStart + (long long) m->local.size());
         }
@@ -299,7 +322,7 @@ private:
             for (size_t k = 0; k < slots.size(); ++k)
             {
                 auto* m = bySlot[k];
-                if (m != nullptr && m->hasData && m->localStart <= from && m->localStart + (long long) m->local.size() >= to)
+                if (m != nullptr && ! hints.off ((int) k) && m->hasData && m->localStart <= from && m->localStart + (long long) m->local.size() >= to)
                     ptr[k] = m->local.data() + (from - m->localStart);
             }
             for (int pos = 0; pos < count; pos += 4096)
@@ -337,7 +360,10 @@ private:
             const auto edges = est.directedEdges();
             int ref = -1;
             for (size_t k = 0; k < slots.size(); ++k) if (slots[k] == refSnap) ref = (int) k;
-            res = solveSession ((int) slots.size(), edges, ref, (double) maxLag);
+            res = solveSession ((int) slots.size(), edges, ref, (double) maxLag, hints);
+            for (size_t k = 0; k < res.size(); ++k)
+                if (res[k].group < 0 && res[k].why != LeftAlone::off && (bySlot[k] == nullptr || ! bySlot[k]->hasData))
+                    res[k].why = LeftAlone::noAudio;
         }
 
         lk.lock();
@@ -350,7 +376,7 @@ private:
         {
             bool same = res.size() == lastResult.size();
             for (size_t k = 0; same && k < res.size(); ++k)
-                same = res[k].group == lastResult[k].group && res[k].polarity == lastResult[k].polarity
+                same = res[k].group == lastResult[k].group && res[k].letter == lastResult[k].letter && res[k].polarity == lastResult[k].polarity
                     && std::abs (res[k].delaySamples - lastResult[k].delaySamples) <= 0.5;
             stable = same ? stable + 1 : 0;
             lastResult = res;

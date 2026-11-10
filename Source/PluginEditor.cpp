@@ -236,7 +236,7 @@ void AlignStatusView::update()
                 b = "This track: Delay " + String (ms, 3) + " ms" + (me->result.polarity < 0 ? ", inverted" : "")
                   + (me->result.anchor ? " (the anchor)" : "") + ", " + String (roundToInt (me->result.sure * 100.0)) + " % sure.";
             }
-            else b = "This track was left alone: it doesn't share enough of the same sound with the others (or its links disagree).";
+            else if (me != nullptr) b = "This track: " + SessionList::leftAloneText (*me) + ". Its settings weren't changed.";
         }
         else
         {
@@ -315,8 +315,24 @@ void SessionList::update()
     st = proc.hubStatus();
     String s2 = String ((int) st.state) + "|" + String (st.id) + "|" + String (proc.hubMemberId());
     for (auto& m : st.members)
-        s2 << "|" << m.id << m.name << (int) m.ref << m.result.group << String (m.result.delaySamples, 2) << m.result.polarity << (int) m.live;
+        s2 << "|" << m.id << m.name << (int) m.ref << m.group << m.result.group << m.result.letter << (int) m.result.why
+           << String (m.result.delaySamples, 2) << m.result.polarity << (int) m.live;
     if (s2 != sig) { sig = s2; setSize (getWidth(), rowsHeight()); repaint(); }
+}
+
+String SessionList::leftAloneText (const sa::AlignHub::MemberView& m)
+{
+    using W = sa::LeftAlone;
+    const String dash (CharPointer_UTF8 (" \xe2\x80\x94 "));
+    switch (m.result.why)
+    {
+        case W::off:          return m.group == -2 ? "off" + dash + "sits out" : "off" + dash + "name looks like a bus";
+        case W::noAudio:      return "left alone" + dash + "no audio heard";
+        case W::disagree:     return "left alone" + dash + "measurements disagree";
+        case W::notWithGroup: return "left alone" + dash + "nothing shared with group " + String::charToString ((juce_wchar) ('A' + jmax (0, m.group)));
+        case W::nothingShared:return "left alone" + dash + "nothing shared";
+        default:              return {};
+    }
 }
 
 void SessionList::paint (Graphics& g)
@@ -341,21 +357,35 @@ void SessionList::paint (Graphics& g)
         g.setColour (me ? colours::text : colours::text.withAlpha (0.85f));
         String name = m.name.empty() ? "Track " + String (m.id) : String (m.name);
         if (m.ref) name << "  [REF]";
-        g.drawText (name, cName, y, cGroup - cName - 8, 16, Justification::centredLeft);
+        const int nameW = cGroup - cName - 8;
+        g.drawText (name, cName, y, nameW, 16, Justification::centredLeft);
+        // what the name told it (dim), and a manual group setting
+        String tag = sa::familyName (m.family);
+        if (m.group >= 0) tag << (tag.isEmpty() ? "" : ", ") << "set to " << String::charToString ((juce_wchar) ('A' + m.group));
+        if (tag.isNotEmpty())
+        {
+            const int used = jmin (nameW - 40, GlyphArrangement::getStringWidthInt (g.getCurrentFont(), name) + 10);
+            g.setFont (FontOptions (10.5f));
+            g.setColour (colours::dim);
+            g.drawText (tag, cName + used, y, nameW - used, 16, Justification::centredLeft);
+        }
         g.setColour (colours::dim);
         if (hasResult && st.id > 0 && m.result.group >= 0)
         {
             const double ms = m.result.delaySamples * 1000.0 / rate;
             g.setColour (colours::text);
-            g.drawText (String::charToString ((juce_wchar) ('A' + m.result.group)), cGroup, y, 60, 16, Justification::centredLeft);
+            g.setFont (FontOptions (12.0f, me ? Font::bold : Font::plain));
+            g.drawText (String::charToString ((juce_wchar) ('A' + jmax (0, m.result.letter))), cGroup, y, 60, 16, Justification::centredLeft);
             const String msText = std::abs (ms) < 0.0005 ? String ("0.000") : (ms > 0 ? "+" : "") + String (ms, 3);
             g.drawText (msText + " ms" + (m.result.anchor ? "  (anchor)" : ""), cDelay, y, 130, 16, Justification::centredLeft);
             g.drawText (m.result.polarity < 0 ? "inverted" : "normal", cPol, y, 70, 16, Justification::centredLeft);
             g.setColour (m.result.sure >= 0.7 ? colours::good : colours::accent);
             g.drawText (String (roundToInt (m.result.sure * 100.0)) + " %", cSure, y, 80, 16, Justification::centredLeft);
         }
+        else if (m.off())
+            g.drawText (leftAloneText (m), cGroup, y, w - cGroup, 16, Justification::centredLeft);
         else if (hasResult && st.id > 0)
-            g.drawText (String (CharPointer_UTF8 ("left alone \xe2\x80\x94 nothing shared")), cGroup, y, w - cGroup, 16, Justification::centredLeft);
+            g.drawText (leftAloneText (m), cGroup, y, w - cGroup, 16, Justification::centredLeft);
         else
             g.drawText (st.state == sa::AlignHub::State::listening ? (m.live ? "listening..." : "no audio yet") : "", cGroup, y, w - cGroup, 16, Justification::centredLeft);
         y += 18;
@@ -445,8 +475,21 @@ SumAlignEditor::SumAlignEditor (SumAlignProcessor& p)
                           "Without a REF, the earliest track in each group stays at 0 and the rest move earlier.");
     refButton.onClick = [this] { proc.setRef (refButton.getToggleState()); };
     addChildComponent (refButton);
+    groupBox.addItem ("Auto", 1);
+    for (int g = 0; g < 8; ++g) groupBox.addItem ("Group " + String::charToString ((juce_wchar) ('A' + g)), 2 + g);
+    groupBox.addItem ("Off", 10);
+    groupBox.setTooltip ("Auto: grouped by the sound tracks share, helped by track names (drums, bass, guitar, vocals, keys "
+                         "never mix; names like 'Drum Bus' or 'Verb' sit out).\n"
+                         "Group A-H: put this track in that group yourself. It's only aligned with tracks in the same group.\n"
+                         "Off: sits out of session ALIGN. Use it on buses, aux returns and effect tracks.");
+    groupBox.onChange = [this]
+    {
+        const int id = groupBox.getSelectedId();
+        proc.setGroupSetting (id == 1 ? -1 : id == 10 ? -2 : id - 2);
+    };
+    addChildComponent (groupBox);
     sessionList.setTooltip ("Every SumAlign track in this session. Tracks in the same group were lined up together; "
-                            "'left alone' tracks don't share enough sound with the others and keep their settings.");
+                            "'left alone' tracks keep their settings (the reason is shown). The dim word after a name is the instrument read from it.");
     sessionView.setViewedComponent (&sessionList, false);
     sessionView.setScrollBarsShown (true, false);
     addChildComponent (sessionView);
@@ -498,6 +541,7 @@ void SumAlignEditor::timerCallback()
     const bool session = proc.sessionMode();
     if (session != lastSession) { lastSession = session; resized(); repaint(); }
     refButton.setVisible (session);
+    groupBox.setVisible (session);
     sessionView.setVisible (session);
     earlierPoint.setVisible (! session); laterPoint.setVisible (! session); pointLabel.setVisible (! session);
     if (session)
@@ -506,6 +550,8 @@ void SumAlignEditor::timerCallback()
         bool hubRef = false;
         for (auto& m : proc.hubStatus().members) if (m.id == proc.hubMemberId()) hubRef = m.ref;
         refButton.setToggleState (hubRef, dontSendNotification);
+        const int gs = proc.groupSetting();
+        groupBox.setSelectedId (gs == -1 ? 1 : gs == -2 ? 10 : gs + 2, dontSendNotification);
     }
 
     const bool listening = session ? proc.hubStatus().state == sa::AlignHub::State::listening
@@ -598,7 +644,8 @@ void SumAlignEditor::resized()
         row.removeFromLeft (4);
         laterPoint.setBounds (row);
         pointLabel.setBounds (pts.withTop (row.getBottom() + 2).withHeight (16));
-        refButton.setBounds (pts.withSizeKeepingCentre (90, 30).withX (pts.getRight() - 90));
+        refButton.setBounds (pts.withSizeKeepingCentre (80, 30).withX (pts.getRight() - 80));
+        groupBox.setBounds (pts.withSizeKeepingCentre (108, 30).withX (pts.getX()));
         top.removeFromRight (12);
         alignStatus.setBounds (top.withSizeKeepingCentre (top.getWidth(), 56));
         a.removeFromTop (6);

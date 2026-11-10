@@ -225,6 +225,101 @@ static void testSolverRobust()
     std::vector<sa::PairEdge> far { { 0, 1, 2000.0, 1, 0.9, 50, 1.5 } };
     r = sa::solveSession (2, both (far), -1, 1440);
     CHECK (r[1].clamped && std::abs (r[1].delaySamples + 1440) < 1e-9, "clamp: %.1f", r[1].delaySamples);
+
+    // the split-vote track is reported as "measurements disagree", the loner as "nothing shared"
+    r = sa::solveSession (4, both (c), -1, 1440);
+    CHECK (r[3].why == sa::LeftAlone::disagree, "split-vote reason %d", (int) r[3].why);
+    r = sa::solveSession (5, both (g), -1, 1440);
+    CHECK (r[4].why == sa::LeftAlone::nothingShared && r[0].why == sa::LeftAlone::no, "loner reason %d", (int) r[4].why);
+}
+
+static std::vector<sa::PairEdge> bothWays (std::vector<sa::PairEdge> v)
+{
+    std::vector<sa::PairEdge> out;
+    for (auto x : v) { out.push_back (x); std::swap (x.a, x.b); x.lag = -x.lag; out.push_back (x); }
+    return out;
+}
+
+static void testNames()
+{
+    std::printf ("Track names: family and bus\n");
+    using F = sa::Family;
+    struct C { const char* name; F fam; bool bus; };
+    const C cases[] = {
+        { "Kick trig", F::drums, false }, { "Kick In", F::drums, false }, { "KICK", F::drums, false }, { "Kick Port", F::drums, false },
+        { "SNARE", F::drums, false }, { "Snare Top LDC", F::drums, false }, { "Snare Bot", F::drums, false }, { "SnareBottom", F::drums, false },
+        { "Sn Btm", F::drums, false }, { "FT2", F::drums, false }, { "Fl1", F::drums, false }, { "Floor Tom", F::drums, false },
+        { "RT1", F::drums, false }, { "Rack Tom 2", F::drums, false }, { "OH L", F::drums, false }, { "Overheads", F::drums, false },
+        { "Room R", F::drums, false }, { "Hi-Hat", F::drums, false }, { "HH", F::drums, false }, { "Ride", F::drums, false },
+        { "Bass Drum", F::drums, false }, { "BassDrum", F::drums, false },
+        { "Bass DI", F::bass, false }, { "Bass Amp", F::bass, false }, { "BASS_D.I.", F::bass, false }, { "Bs Mic", F::bass, false },
+        { "Gtr Room", F::guitar, false }, { "Guitar DI", F::guitar, false }, { "Gtr 414", F::guitar, false }, { "Ac Gtr", F::guitar, false },
+        { "Lead Vox", F::vocals, false }, { "BGV 2", F::vocals, false }, { "Piano L", F::keys, false },
+        { "414", F::unknown, false }, { "Ribbon", F::unknown, false }, { "Audio 3", F::unknown, false }, { "LDC", F::unknown, false }, { "DI", F::unknown, false },
+        { "Drum Bus", F::drums, true }, { "Kick Aux", F::drums, true }, { "Verb", F::unknown, true }, { "Drum Smash", F::drums, true },
+        { "Bass Bus", F::bass, true }, { "Gtr Stem", F::guitar, true }, { "FX Return", F::unknown, true },
+    };
+    int bad = 0;
+    for (auto& c : cases)
+    {
+        const auto ni = sa::classifyTrackName (c.name);
+        if (ni.family != c.fam || ni.bus != c.bus)
+        {
+            ++bad;
+            CHECK (false, "'%s': family '%s' bus %d, want '%s' bus %d", c.name, sa::familyName (ni.family), (int) ni.bus, sa::familyName (c.fam), (int) c.bus);
+        }
+    }
+    std::printf ("  %d names, %d wrong\n", (int) (sizeof (cases) / sizeof (cases[0])), bad);
+    CHECK (! sa::familiesMayLink (F::drums, F::bass) && sa::familiesMayLink (F::bass, F::bass) && sa::familiesMayLink (F::unknown, F::guitar), "familiesMayLink");
+}
+
+static void testHints()
+{
+    std::printf ("Hints: families keep bleed out, manual groups, Off\n");
+    using F = sa::Family;
+    // 0 kick in, 1 snare, 2 OH  (drums)   3 bass DI, 4 bass amp (bass)
+    // the bass amp mic hears the kick confidently (bleed), and the DI/amp pair links the two bass tracks
+    std::vector<sa::PairEdge> e { { 0, 1, 20.0, 1, 0.9, 80, 1.5 }, { 0, 2, 150.0, 1, 0.9, 80, 1.5 }, { 1, 2, 130.0, 1, 0.9, 80, 1.5 },
+                                  { 0, 4, 400.0, 1, 0.9, 80, 1.5 }, { 3, 4, 60.0, -1, 0.9, 80, 1.5 } };
+    const auto E = bothWays (e);
+
+    auto r = sa::solveSession (5, E, -1, 1440);
+    CHECK (r[0].group >= 0 && r[0].group == r[4].group && r[3].group == r[4].group, "without names the bleed joins everything (%d %d %d)", r[0].group, r[3].group, r[4].group);
+
+    sa::SessionHints h;
+    h.family = { F::drums, F::drums, F::drums, F::bass, F::bass };
+    r = sa::solveSession (5, E, -1, 1440, h);
+    CHECK (r[0].group >= 0 && r[0].group == r[1].group && r[1].group == r[2].group, "drums together");
+    CHECK (r[3].group >= 0 && r[3].group == r[4].group && r[3].group != r[0].group, "bass DI + amp their own group (%d %d vs %d)", r[3].group, r[4].group, r[0].group);
+    CHECK (r[3].anchor && std::abs (r[4].delaySamples + 60.0) < 1e-9 && r[4].polarity == -1, "bass amp: %.2f pol %d", r[4].delaySamples, r[4].polarity);
+    CHECK (r[0].letter == 0 && r[3].letter == 1, "letters %d %d", r[0].letter, r[3].letter);
+
+    // manual: a weak (0.55) link that Auto ignores is used when both are put in group C; auto group takes A
+    std::vector<sa::PairEdge> w { { 0, 1, 12.0, 1, 0.9, 80, 1.5 }, { 2, 3, -7.0, 1, 0.55, 80, 1.5 } };
+    r = sa::solveSession (4, bothWays (w), -1, 1440);
+    CHECK (r[2].group == -1 && r[3].group == -1, "weak link grouped in Auto");
+    sa::SessionHints m; m.group = { -1, -1, 2, 2 };
+    r = sa::solveSession (4, bothWays (w), -1, 1440, m);
+    CHECK (r[2].group >= 0 && r[2].group == r[3].group && r[2].letter == 2 && std::abs (r[2].delaySamples + 7.0) < 1e-9 && std::abs (r[3].delaySamples) < 1e-9
+           && r[3].anchor, "manual C: %d %d letter %d, %.2f %.2f", r[2].group, r[3].group, r[2].letter, r[2].delaySamples, r[3].delaySamples);
+    CHECK (r[0].letter == 0, "auto group letter %d (want A)", r[0].letter);
+
+    // manual groups are closed: a track set to A doesn't link to an Auto track, even with a strong link
+    sa::SessionHints c; c.group = { 0, 0, -1, -1 };
+    std::vector<sa::PairEdge> x { { 0, 1, 12.0, 1, 0.9, 80, 1.5 }, { 1, 2, 30.0, 1, 0.95, 80, 1.5 }, { 2, 3, 5.0, 1, 0.9, 80, 1.5 } };
+    r = sa::solveSession (4, bothWays (x), -1, 1440, c);
+    CHECK (r[0].group == r[1].group && r[2].group == r[3].group && r[0].group != r[2].group && r[0].group >= 0 && r[2].group >= 0, "closed groups");
+    CHECK (r[0].letter == 0 && r[2].letter == 1, "letters %d %d", r[0].letter, r[2].letter);
+
+    // a manual-group member that shares nothing with its group
+    sa::SessionHints s; s.group = { 0, 0, 0 };
+    r = sa::solveSession (3, bothWays ({ { 0, 1, 12.0, 1, 0.9, 80, 1.5 } }), -1, 1440, s);
+    CHECK (r[2].group == -1 && r[2].why == sa::LeftAlone::notWithGroup, "lone A member: group %d why %d", r[2].group, (int) r[2].why);
+
+    // Off: sits out, and a REF on it is ignored
+    sa::SessionHints o; o.group = { -1, -1, -2 };
+    r = sa::solveSession (3, bothWays ({ { 0, 1, 12.0, 1, 0.9, 80, 1.5 }, { 0, 2, 3.0, 1, 0.99, 80, 1.5 }, { 1, 2, -9.0, 1, 0.99, 80, 1.5 } }), 2, 1440, o);
+    CHECK (r[2].group == -1 && r[2].why == sa::LeftAlone::off && r[0].group >= 0 && r[0].anchor, "off: %d why %d", r[2].group, (int) r[2].why);
 }
 
 static void testHub()
@@ -276,12 +371,55 @@ static void testHub()
     CHECK (hub->numMembers() == 0, "members left %d", hub->numMembers());
 }
 
+static void testHubHints()
+{
+    std::printf ("Hub: a 'Drum Bus' instance (the sum of the kit) sits out; a track set to Off sits out\n");
+    const double sr = 48000.0;
+    auto kit = makeKit (sr, 25.0, 31);
+    auto hub = sa::AlignHub::get();
+    std::vector<int> ids;
+    for (auto& n : kit.names) ids.push_back (hub->join (n));
+    const int busId = hub->join ("Drum Bus");
+    hub->setGroup (ids[7], -2);   // the vocal: Off
+    Vec bus (kit.tracks[0].size(), 0.0f);
+    for (size_t m = 0; m < 7; ++m) for (size_t i = 0; i < bus.size(); ++i) bus[i] += kit.tracks[m][i];
+    hub->start (sr, (int) std::lround (sa::kMaxShiftMs * 0.001 * sr));
+    long long timeline = 0;
+    for (size_t pos = 0; pos + 512 <= bus.size(); pos += 512, timeline += 512)
+    {
+        for (size_t m = 0; m < ids.size(); ++m) hub->push (ids[m], timeline, kit.tracks[m].data() + pos, 512, sr);
+        hub->push (busId, timeline, bus.data() + pos, 512, sr);
+        std::this_thread::sleep_for (std::chrono::microseconds (3500));   // ~3x real time, like the DAW
+    }
+    for (int i = 0; i < 400 && hub->isListening(); ++i) std::this_thread::sleep_for (std::chrono::milliseconds (10));
+    if (hub->isListening()) { hub->finishNow(); std::this_thread::sleep_for (std::chrono::milliseconds (500)); }
+    const auto st = hub->getStatus();
+    CHECK (st.state == sa::AlignHub::State::done, "state %d", (int) st.state);
+    for (auto& mv : st.members)
+    {
+        if (mv.id == busId) CHECK (mv.result.group == -1 && mv.result.why == sa::LeftAlone::off && mv.off(), "bus: group %d why %d", mv.result.group, (int) mv.result.why);
+        else if (mv.id == ids[7]) CHECK (mv.result.why == sa::LeftAlone::off, "vocal set to Off: why %d", (int) mv.result.why);
+        else
+        {
+            size_t m = 0; while (ids[m] != mv.id) ++m;
+            const double want = -(kit.delay[m] - kit.delay[0]);
+            CHECK (mv.result.group >= 0 && std::abs (mv.result.delaySamples - want) < 0.6, "%s: %.2f want %.2f", kit.names[m].c_str(), mv.result.delaySamples, want);
+            CHECK (mv.family == sa::Family::drums || kit.names[m].find ("LDC") != std::string::npos, "%s family '%s'", kit.names[m].c_str(), sa::familyName (mv.family));
+        }
+    }
+    for (int id : ids) hub->leave (id);
+    hub->leave (busId);
+}
+
 int main()
 {
     testKit();
     testRef();
     testSolverRobust();
+    testNames();
+    testHints();
     testHub();
+    testHubHints();
     if (gFailures == 0) std::printf ("\nALL NETWORK TESTS PASSED\n");
     else                std::printf ("\n%d FAILURE(S)\n", gFailures);
     return gFailures == 0 ? 0 : 1;
